@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 蒸馏产物（含可能的 API 调用缓存）
+out/
+*.png
+!docs/*.png
+distillates/
+.workdir/
+
+# 截图脚本与临时文件
+shot.py
+arch_page*.png
+architecture.pdf
+architecture_full.png
+architecture.svg
+architecture.html
+
+# 环境变量
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
