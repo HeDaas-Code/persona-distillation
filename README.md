@@ -5,6 +5,10 @@
 
 **基于 LangChain DeepAgents · MiniMax-M3**
 
+[![Smoke Tests](https://github.com/HeDaas-Code/persona-distillation/actions/workflows/smoke.yml/badge.svg)](https://github.com/HeDaas-Code/persona-distillation/actions/workflows/smoke.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+
 把多文本长语料视作 _原液_，借化学蒸馏的三段隐喻——_分馏_、_冷凝_、_提纯_——
 逐层分离出角色的人格信号，最终灌装成一张可注入的人格卡、
 一组 **DNA 级别** 人格 Skills 与若干预设对话。
@@ -237,6 +241,8 @@ license: MIT
 ## 快速开始
 
 ### 安装
+
+> **Python ≥ 3.11**（`deepagents` 的最低版本要求）
 
 ```bash
 pip install -r requirements.txt
