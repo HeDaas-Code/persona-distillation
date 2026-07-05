@@ -17,6 +17,12 @@
 
 ---
 
+> **两种工作模式**：
+>
+> - **CLI 直跑模式**（确定性、可复现）—— `distill` 子命令一键完成整套蒸馏。
+> - **主理人 Agent 模式**（交互式）—— `chat` 子命令启动 intake 子包，
+>   先做人物识别 + 索引 + 档案，让用户从候选人物里选一位再蒸馏。
+
 > **灵感**：Skills 生成逻辑参考 [nuwa-skill](https://github.com/alchaincyf/nuwa-skill) 的认知操作系统方法论——
 > 捕捉的是 _HOW they think_，不是 _WHAT they said_。
 > 每个人格 Skill 是一套可运行的认知操作系统，而非语录合集。
@@ -61,9 +67,19 @@
 
 ## § 02 · 管线全景
 
-从一摞语料，到一张可注入的人格卡。
+从一摞语料，到一张可注入的人格卡。`chat` 模式在前面多了一层 intake 预处理。
 
 ```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  PRE-STAGE · INTAKE 预处理 (仅 chat 模式)              ↻ MiniMax-M3      │
+│                                                                         │
+│  语料 ──→ chunk ──→ NER/Classifier ──→ Chroma+SQLite ──→ Profile     │
+│         intake 子包   人物 + 类别     跨文件聚合        候选档案        │
+│         name_extractor  speech·       index_store       profile_builder│
+│                       appearance·                       + reranker    │
+│                       event                             top-k 选段    │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ⇣
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  INPUT LAYER · 摄入层                          ↻ MiniMax-M3              │
 │                                                                         │
@@ -103,6 +119,9 @@
 │                                └──────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
                                   ⇣  三重验证过滤未通过模型
+                                  ⇣  ★ DNA BACKFILL (安全网) ★
+                                  ⇣    若 LLM 把 DNA 拼到 system_prompt 文本
+                                  ⇣    6 类节标题正则 → 5 字段回填
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  ④ STAGE · 成品 FINAL PRODUCT — 灌装 DNA 级别 Skills 与预设对话          │
 │                                                                         │
@@ -155,17 +174,23 @@
 
 | 模块 | 文件 | 职责 |
 |:---|:---|:---|
-| **config** | `config.py` | 运行配置中枢。模型字符串、分块参数、显著度阈值、Skills 数量上限。默认 `minimax:MiniMax-M3` |
-| **schemas** | `schemas.py` | 结构化契约。PersonaCard / PersonaSkill / Distillate + **DNA 五层**（ExpressionDNA/MentalModel/DecisionHeuristic/AntiPattern/HonestBoundary）+ VerificationResult |
-| **loader** | `loader.py` | 多文本聚合摄入。txt/md 直读、json/jsonl 抽取正文、csv 按行展开 |
+| **config** | `config.py` | 运行配置中枢。模型字符串、分块参数、显著度阈值、Skills 数量上限。默认 `minimax:MiniMax-M3`。`.env` 启动时自动加载，启动即校验 API key。`dry_run` 跳过校验（CI/单测用） |
+| **schemas** | `schemas.py` | 结构化契约。PersonaCard / PersonaSkill / Distillate + **DNA 五层**（ExpressionDNA/MentalModel/DecisionHeuristic/AntiPattern/HonestBoundary）+ VerificationResult。`extra="forbid"` 严拒 schema 外字段；`model_post_init` 全空告警 |
+| **loader** | `loader.py` | 多文本聚合摄入。txt/md 直读、json/jsonl 抽取正文、csv 按行展开；`max_input_mb` 单文件大小上限 |
 | **chunker** | `chunker.py` | tiktoken 感知分块 + 重叠，避免从句中劈开 |
-| **prompts** | `prompts.py` | 蒸馏方法论 SKILL.md + 四个子智能体系统提示词（含 DNA 提炼与三重验证要求） |
-| **agents** | `agents.py` | DeepAgents 装配工厂。`build_model` 解析 `minimax:MiniMax-M3`；四个带 `response_format` 的子智能体 |
-| **pipeline** | `pipeline.py` | 确定性流水线。加载→分块→分馏→冷凝提纯→**三重验证**→设计 Skills→撰写对话 |
+| **prompts** | `prompts.py` | 蒸馏方法论 SKILL.md + 四个子智能体系统提示词（含 DNA 提炼与三重验证要求）+ intake 4 个新提示词（NER/ProfileBuilder/Bridger/Orchestrator） |
+| **agents** | `agents.py` | DeepAgents 装配工厂。`build_model` 解析 `minimax:MiniMax-M3`；蒸馏侧 4 个带 `response_format` 的子智能体 + intake 侧 4 个子智能体 + `build_intake_orchestrator` 主理人 Agent |
+| **pipeline** | `pipeline.py` | 确定性流水线。加载→分块→分馏→冷凝提纯→**三重验证**→**DNA Backfill**→设计 Skills→撰写对话 |
 | **triple_verification** | `triple_verification.py` | **DNA 三重验证**。跨域复现（distillates 证据复核）+ 生成力 + 排他性，未通过的心智模型一律丢弃 |
-| **renderer** | `renderer.py` | 人格卡渲染。`persona_card.json`（机器可导入）+ `persona_card.md`（人类可读） |
+| **renderer** | `renderer.py` | 人格卡渲染。`persona_card.json`（机器可导入）+ `persona_card.md`（人类可读）。用 `model_dump(exclude_none=True)` 一次性写入全部 DNA 字段 |
 | **skills_writer** | `skills_writer.py` | Skills 目录落盘。每个 skill 写成 nuwa 风格 SKILL.md：角色扮演规则 + 回答工作流 + 心智模型（含三重验证证据）+ 决策启发式 + 表达DNA + 反模式 + 诚实边界 |
-| **main** | `main.py` | CLI 入口。`distill` / `inspect` 两个子命令 |
+| **main** | `main.py` | CLI 入口。`distill` / `inspect` / `chat` 三个子命令 |
+| **intake / dna_extractor** | `intake/dna_extractor.py` | **DNA Backfill 解析器**。6 类节标题正则（中文方括号 / 全角方括号 / 英文冒号 / Markdown 标题 / 中文圆括号 / 无前导符号）→ 5 字段结构化回填。`backfill_dna_from_system_prompt` 是 DNA 字段丢失的最后一道安全网 |
+| **intake / name_extractor** | `intake/name_extractor.py` | LLM-NER。识别分块中所有人物提及，分类为 speech/appearance/event，附原文证据与起止位置 |
+| **intake / index_store** | `intake/index_store.py` | Chroma + SQLite 双写索引。跨文件聚合人物，支持向量检索 + 类别过滤 |
+| **intake / embedder** | `intake/embedder.py` | 嵌入 + 重排序模型封装。在线走真实 sentence-transformers；离线用 `HashEmbeddings` 兜底 |
+| **intake / profile_builder** | `intake/profile_builder.py` | 人物档案摘要。从索引聚合 top-k 选段，LLM 生成 ≤200 字档案 |
+| **intake / bridge** | `intake/bridge.py` | 桥接蒸馏。`rebuild_corpus_dir` 把档案重建为临时语料；`distill_character` 调 PersonaDistiller 启动四阶段蒸馏 |
 
 ---
 
@@ -246,21 +271,23 @@ license: MIT
 
 ```bash
 pip install -r requirements.txt
-export MINIMAX_API_KEY=sk-...   # 见 https://platform.minimax.io
+cp .env.example .env       # 可选；启动时框架会自动尝试加载 .env
+${EDITOR:-vi} .env        # 填入 MINIMAX_API_KEY 等
 ```
 
-### 确定性流水线（推荐，可复现）
+环境变量：
 
-```python
-from persona_distillation import PersonaDistiller, DistillationConfig
+| 变量 | 默认值 | 含义 |
+|:---|:---|:---|
+| `MINIMAX_API_KEY` | — | **必填**（除非 `dry_run=True`）。启动时自动校验 |
+| `MINIMAX_BASE_URL` | `https://api.minimax.io/v1` | OpenAI 兼容端点 |
+| `MINIMAX_MODEL` | `minimax:MiniMax-M3` | provider:model 字符串 |
+| `MINIMAX_PERSONA_ID` | `""` | CLI 不指定时使用的默认人格 ID |
+| `EMBEDDING_MODEL` | `BAAI/bge-m3` | intake 子包的嵌入模型 |
+| `RERANK_MODEL` | `BAAI/bge-reranker-base` | intake 子包的重排序模型 |
+| `OFFLINE` | `0` | 设为 `1` 用 `HashEmbeddings` 兜底（无网络 / 离线测试） |
 
-distiller = PersonaDistiller(DistillationConfig(
-    model="minimax:MiniMax-M3", persona_id="arakawa_sensei"
-))
-result = distiller.distill("examples/sample_corpus", output_dir="./out")
-```
-
-### CLI
+### CLI 一键蒸馏（确定性，可复现）
 
 ```bash
 # 蒸馏（默认 --model minimax:MiniMax-M3）
@@ -271,7 +298,26 @@ python -m persona_distillation.main distill ./examples/sample_corpus ./out \
 python -m persona_distillation.main inspect ./out
 ```
 
-### 自主编排模式（交互式）
+### 主理人 Agent（交互式）
+
+```bash
+# 启动主理人 Agent：先做人物识别 + 索引 + 档案
+# 用户从候选人物里选一位，再调 PersonaDistiller 蒸馏
+python -m persona_distillation.main chat --workdir ./intake_workdir
+```
+
+### Python API
+
+```python
+from persona_distillation import PersonaDistiller, DistillationConfig
+
+distiller = PersonaDistiller(DistillationConfig(
+    model="minimax:MiniMax-M3", persona_id="arakawa_sensei"
+))
+result = distiller.distill("examples/sample_corpus", output_dir="./out")
+```
+
+### 自主编排模式（交互式，蒸馏侧）
 
 ```python
 from persona_distillation.agents import build_orchestrator
@@ -301,15 +347,66 @@ out/
 
 ---
 
+## § 06 · 4 道防线（DNA 字段完整性保障）
+
+LLM 经常"擅自"把 DNA 五层塞进 `system_prompt` 文本里（典型如 MiniMax-M3 端点），
+导致 `persona_card.json` 顶层 DNA 字段全空、机器读不到。
+本框架从四个层面交叉保障：
+
+| # | 防线 | 位置 | 作用 |
+|:---:|:---|:---|:---|
+| 1 | **后处理回填** | `pipeline._condense_and_purify` → `intake.dna_extractor.backfill_dna_from_system_prompt` | 6 类节标题正则解析 system_prompt 文本 → 5 字段结构化（安全网） |
+| 2 | **Schema 严格化** | `schemas.PersonaCard.model_config = ConfigDict(extra="forbid")` | 拒绝 LLM 输出的 schema 外字段（`tools` / `skills` 等） |
+| 3 | **Renderer 修正** | `renderer.py` 改用 `card.model_dump(exclude_none=True)` | 不再因手写字段列表而漏掉 DNA 字段（**这才是字段空值的真正元凶**） |
+| 4 | **提示词强化** | `prompts.SYNTHESIZER_SYSTEM` 末尾追加"禁止" + "塞进" + "system_prompt" | 显式告诉 LLM：DNA 五层必须作为独立结构化字段输出 |
+
+另有两道结构化保障：
+
+- `error_reply` 改为可选 + 默认空字符串——适配 LLM 偶尔缺该字段的不稳定输出。
+- `PersonaCard.model_post_init` 检测 5 字段全空时输出 WARNING——给未来"system_prompt 也丢了"的灾难场景留监控钩子。
+
+### 端到端验证
+
+`examples/sample_corpus` 真实蒸馏后 `out/persona_card.json` 实际产出：
+
+| 字段 | 实际值 |
+|---|---:|
+| `mental_models` | 4 |
+| `anti_patterns` | 6 |
+| `expression_dna.vocabulary` | 10 |
+| `expression_dna.signature_metaphors` | 4 |
+| `expression_dna.opening_samples` | 2 |
+| 落盘 SKILL.md 数 | 5 |
+| 预设对话数 | 8 |
+
+> `decision_heuristics` / `honest_boundaries` 在某些 LLM 端点下为 0——
+> 模型把这类信号融进了 `[输出约束]` / `[雷区]` 等其他节，
+> 无独立节标题时 backfill 无法识别（"宁缺毋滥"原则接受此结果）。
+
+---
+
+## § 07 · 测试
+
+```bash
+.venv/bin/python -m tests.smoke_test              # 11/11
+.venv/bin/python -m tests.optimization_verify     # 33/33
+.venv/bin/python -m pytest tests/dna_extractor_test.py -v        # 15/15
+.venv/bin/python -m pytest tests/test_schema_strictness.py -v   #  5/5
+# Total: 64/64
+```
+
+---
+
 ## 技术栈
 
-`DeepAgents` · `LangChain` · `MiniMax-M3` · `Pydantic` · `tiktoken`
+`DeepAgents` · `LangChain` · `MiniMax-M3` · `Pydantic` · `tiktoken` · `ChromaDB` · `sentence-transformers`
 
 ## 致谢
 
 - [nuwa-skill](https://github.com/alchaincyf/nuwa-skill) — DNA 级别认知操作系统与三重验证方法论
 - [Anthropic Agent Skills](https://docs.anthropic.com/en/docs/agents/skills) — SKILL.md 规范
 - [DeepAgents](https://github.com/langchain-ai/deepagents) — 子智能体编排引擎
+- [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) · [BAAI/bge-reranker-base](https://huggingface.co/BAAI/bge-reranker-base) — intake 子包默认嵌入 / 重排序模型
 
 ## License
 
