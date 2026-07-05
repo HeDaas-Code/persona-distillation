@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
+import uuid as _uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -26,12 +28,20 @@ DEFAULT_MAX_INPUT_MB = 100
 
 @dataclass
 class LoadedDoc:
-    """一篇加载后的文档。"""
+    """一篇加载后的文档。
+
+    ``content_hash`` 是解码后正文的 SHA-256 hex，``corpus_uuid`` 是基于该哈希
+    生成的确定性 UUID v5。两者都算在「解码后」的字符串上，因此编码不同但
+    内容相同的文件（如 UTF-8 vs UTF-16）会得到相同的 hash / uuid，
+    便于跨运行与跨源的去重和缓存命中。
+    """
 
     path: str
     relpath: str
     ext: str
     text: str
+    content_hash: str = ""
+    corpus_uuid: str = ""
     meta: dict = field(default_factory=dict)
 
     @property
@@ -39,12 +49,41 @@ class LoadedDoc:
         return Path(self.relpath).stem
 
 
+def _read_text_auto(p: Path) -> str:
+    """BOM 感知 + 多编码兜底的文本读取。
+
+    顺序：
+    1. UTF-16 LE/BE BOM → 对应 UTF-16 解码
+    2. UTF-8 BOM → UTF-8 解码（去 BOM）
+    3. 无 BOM：先试 UTF-8（严格），失败试 UTF-16，再失败试 GB18030（中文 Windows 常见）
+
+    这样既能正确读 UTF-16 编码的中文小说（如轻小说文库导出的 .txt），
+    也不会误伤普通 UTF-8 文件。
+    """
+    raw = p.read_bytes()
+    if raw.startswith(b"\xff\xfe"):
+        return raw[2:].decode("utf-16-le", errors="replace")
+    if raw.startswith(b"\xfe\xff"):
+        return raw[2:].decode("utf-16-be", errors="replace")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", errors="replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return raw.decode("utf-16")
+    except UnicodeDecodeError:
+        pass
+    return raw.decode("gb18030", errors="replace")
+
+
 def _load_text(p: Path) -> str:
-    return p.read_text(encoding="utf-8", errors="replace")
+    return _read_text_auto(p)
 
 
 def _load_json(p: Path) -> str:
-    data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    data = json.loads(_read_text_auto(p))
 
     def _flatten(obj) -> str:
         if isinstance(obj, str):
@@ -64,7 +103,7 @@ def _load_json(p: Path) -> str:
 
 def _load_jsonl(p: Path) -> str:
     lines: list[str] = []
-    for raw in p.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw in _read_text_auto(p).splitlines():
         raw = raw.strip()
         if not raw:
             continue
@@ -88,7 +127,11 @@ def _load_jsonl(p: Path) -> str:
 
 def _load_csv(p: Path, delimiter: str = ",") -> str:
     rows: list[str] = []
-    with p.open(encoding="utf-8", errors="replace", newline="") as f:
+    # csv 模块需要文本模式流；先用 _read_text_auto 解码拿到正确字符串，再用 StringIO 喂 csv
+    import io
+
+    text = _read_text_auto(p)
+    with io.StringIO(text, newline="") as f:
         reader = csv.reader(f, delimiter=delimiter)
         for row in reader:
             rows.append(delimiter.join(row))
@@ -156,10 +199,19 @@ def _load_one(p: Path, base: Path) -> LoadedDoc:
     ext = p.suffix.lower()
     loader = _EXT_LOADERS.get(ext, _load_text)
     text = loader(p)
+    # 哈希算在解码后的字符串上：编码不同但内容相同的文件会得到相同 hash / uuid。
+    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    corpus_uuid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, content_hash))
     return LoadedDoc(
         path=str(p),
         relpath=str(p.relative_to(base)),
         ext=ext,
         text=text,
-        meta={"size_chars": len(text)},
+        content_hash=content_hash,
+        corpus_uuid=corpus_uuid,
+        meta={
+            "size_chars": len(text),
+            "content_hash": content_hash,
+            "corpus_uuid": corpus_uuid,
+        },
     )

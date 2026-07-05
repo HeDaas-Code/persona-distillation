@@ -23,6 +23,21 @@ from persona_distillation.pipeline import PersonaDistiller
 from persona_distillation.schemas import DistillationResult
 
 
+def _configure_logging(debug: bool = False) -> None:
+    """配置日志：默认 INFO，--debug 时 DEBUG。
+
+    persona_distillation 的 logger 始终至少 INFO，方便排查 NER/蒸馏问题。
+    """
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=logging.WARNING,  # 第三方库保持 WARNING
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
+    logging.getLogger("persona_distillation").setLevel(level)
+
+
 def _cmd_distill(args: argparse.Namespace) -> int:
     cfg = DistillationConfig(
         model=args.model,
@@ -88,6 +103,8 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         intake_chunk_overlap=args.chunk_overlap,
         offline=args.offline,
         debug=args.debug,
+        show_progress=not getattr(args, "no_progress", False),
+        profile_max_entries=args.profile_max_entries,
     )
     try:
         agent = build_intake_orchestrator(cfg)
@@ -168,6 +185,9 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--chunk-size", type=int, default=1200, help="intake 分块大小")
     chat.add_argument("--chunk-overlap", type=int, default=120, help="intake 分块重叠")
     chat.add_argument("--offline", action="store_true", help="离线模式（用伪 embedding）")
+    chat.add_argument("--no-progress", action="store_true", help="关闭分块解析进度条")
+    chat.add_argument("--profile-max-entries", type=int, default=0,
+                      help="蒸馏语料每类 excerpts 上限（0=不限，保留全部；默认 0）")
     chat.add_argument("--debug", action="store_true")
     chat.set_defaults(func=_cmd_chat)
     return parser
@@ -175,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    _configure_logging(debug=getattr(args, "debug", False))
     return args.func(args)
 
 

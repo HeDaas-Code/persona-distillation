@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import re
+import uuid as _uuid
 from dataclasses import dataclass
 
 try:
@@ -26,13 +28,18 @@ except Exception:  # pragma: no cover - 环境降级
 
 @dataclass
 class Chunk:
-    """一个分块。"""
+    """一个分块。
+
+    ``uuid`` 是基于分块正文 SHA-256(前 16 hex) 与分块索引生成的确定性 UUID v5：
+    同一份输入文本 + 同一分块顺序 → 同一 ``uuid``。用于跨运行的 chunk 级缓存命中。
+    """
 
     text: str
     index: int
     char_start: int
     char_end: int
     token_count: int
+    uuid: str = ""
 
     def with_source(self, source_file: str, total: int) -> dict:
         return {
@@ -43,6 +50,7 @@ class Chunk:
             "char_end": self.char_end,
             "token_count": self.token_count,
             "text": self.text,
+            "uuid": self.uuid,
         }
 
 
@@ -96,13 +104,19 @@ def chunk_text(
         if not buf:
             return
         body = "\n\n".join(p for _, _, p in buf)
+        # 确定性 UUID v5：基于 (块索引, 块正文 SHA-256[:16])。
+        # 同一份输入文本恒定产生同一 uuid，用于跨运行的 chunk 级缓存键。
+        chunk_index = len(chunks)
+        chunk_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+        chunk_uuid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"{chunk_index}\0{chunk_hash}"))
         chunks.append(
             Chunk(
                 text=body,
-                index=len(chunks),
+                index=chunk_index,
                 char_start=buf[0][0],
                 char_end=buf[-1][1],
                 token_count=buf_tokens,
+                uuid=chunk_uuid,
             )
         )
         # 重叠：保留尾部若干段落，直到累计 token 接近 overlap_tokens

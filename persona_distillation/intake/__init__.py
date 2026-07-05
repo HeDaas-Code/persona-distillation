@@ -44,6 +44,11 @@ from persona_distillation.intake.dna_extractor import (
     backfill_dna_from_system_prompt,
     extract_dna_from_system_prompt,
 )
+from persona_distillation.intake.tools import (
+    IntakeContext,
+    build_intake_context,
+    build_intake_tools,
+)
 
 __all__ = [
     "IndexCategory",
@@ -61,4 +66,7 @@ __all__ = [
     "build_reranker",
     "extract_dna_from_system_prompt",
     "backfill_dna_from_system_prompt",
+    "IntakeContext",
+    "build_intake_context",
+    "build_intake_tools",
 ]

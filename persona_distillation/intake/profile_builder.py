@@ -54,6 +54,56 @@ def _topk_by_text(
     return entries[:top_n]
 
 
+def _take(
+    entries: list[NameIndexEntry],
+    max_entries: int,
+    reranker: Any = None,
+    query: str = "",
+) -> list[NameIndexEntry]:
+    """为蒸馏语料保留条目（与 _topk_by_text 的搜索 top-k 语义不同）。
+
+    - ``max_entries=0``：返回全部条目（reranker 可用时按 salience 排序但不截断，
+      让蒸馏器看到全量语料）
+    - ``max_entries>0``：截断到 max_entries 条（极端长文本时控制内存）
+
+    与 ``_topk_by_text`` 的区别：后者是为搜索结果展示设计的 top-k 截断；
+    本函数是为蒸馏语料重建设计的全量保留，仅在用户显式配置上限时截断。
+    """
+    if not entries:
+        return []
+    if max_entries > 0 and len(entries) > max_entries:
+        # 有 reranker 时先排序再截断，保留最 salient 的 max_entries 条
+        if reranker is not None:
+            sorted_entries = _rerank_sort(entries, reranker, query)
+            return sorted_entries[:max_entries]
+        return entries[:max_entries]
+    # max_entries=0 或条目数未超上限：全部保留（reranker 可用时排序但不截断）
+    if reranker is not None and len(entries) > 1:
+        return _rerank_sort(entries, reranker, query)
+    return entries
+
+
+def _rerank_sort(
+    entries: list[NameIndexEntry],
+    reranker: Any,
+    query: str,
+) -> list[NameIndexEntry]:
+    """用 reranker 对 entries 按 salience 排序（不截断）。失败时返回原顺序。"""
+    try:
+        from langchain_core.documents import Document
+
+        docs = [
+            Document(page_content=e.text, metadata={"uuid": e.uuid, "_idx": i})
+            for i, e in enumerate(entries)
+        ]
+        compressed = reranker.compress_documents(docs, query)
+        ids: list[str] = [d.metadata.get("uuid", "") for d in compressed]
+        by_uuid = {e.uuid: e for e in entries}
+        return [by_uuid[u] for u in ids if u in by_uuid]
+    except Exception:
+        return entries
+
+
 def _fallback_summary(profile: CharacterProfile) -> str:
     """无 LLM 时的兜底 summary。"""
     parts = [
@@ -92,7 +142,8 @@ def build_profile(
     *,
     reranker: Any = None,
     llm: BaseChatModel | None = None,
-    top_n: int = 6,
+    top_n: int = 6,           # 仅用于 summary LLM block，控制上下文长度
+    max_entries: int = 0,     # 0=不限，>0=每类 excerpts 上限（蒸馏语料全量保留）
 ) -> CharacterProfile:
     """从索引里聚合一个人物档案。"""
     all_entries = store.get_character_entries(name)
@@ -117,9 +168,9 @@ def build_profile(
         speech_count=len(speech),
         appearance_count=len(appearance),
         event_count=len(event),
-        speech_excerpts=_topk_by_text(speech, name, top_n, reranker),
-        appearance_excerpts=_topk_by_text(appearance, name, top_n, reranker),
-        event_excerpts=_topk_by_text(event, name, top_n, reranker),
+        speech_excerpts=_take(speech, max_entries, reranker, name),
+        appearance_excerpts=_take(appearance, max_entries, reranker, name),
+        event_excerpts=_take(event, max_entries, reranker, name),
     )
 
     # ---- 调 LLM 生成 summary ----
@@ -132,16 +183,20 @@ def build_profile(
                     return "（无）"
                 return "\n".join(f"- {e.text}" for e in entries)
 
+            # summary LLM block 用 top-6（控制 LLM 上下文长度），与 excerpts 的全量保留解耦
+            speech_top = _topk_by_text(speech, name, top_n, reranker)
+            appearance_top = _topk_by_text(appearance, name, top_n, reranker)
+            event_top = _topk_by_text(event, name, top_n, reranker)
             prompt = SUMMARY_PROMPT.format(
                 name=name,
                 aliases=", ".join(aliases) or "（无）",
                 stats=f"提及 {profile.mention_count} 次 / 对话 {profile.speech_count} / 外貌 {profile.appearance_count} / 事件 {profile.event_count}",
-                n_speech=len(profile.speech_excerpts),
-                n_app=len(profile.appearance_excerpts),
-                n_ev=len(profile.event_excerpts),
-                speech_block=_block(profile.speech_excerpts),
-                appearance_block=_block(profile.appearance_excerpts),
-                event_block=_block(profile.event_excerpts),
+                n_speech=len(speech_top),
+                n_app=len(appearance_top),
+                n_ev=len(event_top),
+                speech_block=_block(speech_top),
+                appearance_block=_block(appearance_top),
+                event_block=_block(event_top),
             )
             resp = llm.invoke(
                 [

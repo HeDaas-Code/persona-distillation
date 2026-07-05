@@ -98,6 +98,12 @@ class DistillationConfig:
     # 索引检索 top-k / 重排序后保留 top-n
     index_top_k: int = 10
     rerank_top_n: int = 6
+    # 蒸馏语料重建时每类 excerpts 的上限
+    # 0 = 不限，保留全部索引条目（推荐，蒸馏需要全量语料提取 DNA）
+    # >0 = 每类最多保留 N 条（极端长文本时控制内存/磁盘）
+    # 注意：与 rerank_top_n 区别——rerank_top_n 控制搜索结果展示和 LLM summary block 的 top-k，
+    #       profile_max_entries 控制蒸馏语料（speech.md/appearance.md/events.md）的全量保留
+    profile_max_entries: int = 0
     # intake 阶段分块目标 token 数（比蒸馏阶段小，保证 NER 粒度）
     intake_chunk_size: int = 1200
     intake_chunk_overlap: int = 120
@@ -107,6 +113,12 @@ class DistillationConfig:
     )
     # P0-4: 启用提示注入防护（推荐开启）
     detect_injection: bool = True
+    # intake 阶段是否向 stderr 输出分块解析进度条
+    show_progress: bool = True
+    """intake 阶段是否向 stderr 输出分块解析进度条。"""
+    # 是否启用 chunk 级缓存（断点续传，跳过已处理 chunk）
+    enable_chunk_cache: bool = True
+    """是否启用 chunk 级缓存（断点续传，跳过已处理 chunk）。"""
 
     def __post_init__(self) -> None:
         """P0-2: 启动时校验 API key，避免跑到一半才报缺 key。"""

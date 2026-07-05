@@ -38,6 +38,7 @@ architecture.html
 .env
 .env.local
 
+
 # OS
 .DS_Store
 Thumbs.db
@@ -46,3 +47,4 @@ Thumbs.db
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+intake_workdir/

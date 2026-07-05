@@ -49,7 +49,13 @@ class NameExtractionResult(BaseModel):
 
 
 class NameIndexEntry(BaseModel):
-    """入库索引条目（带 uuid 与定位信息）。"""
+    """入库索引条目（带 uuid 与定位信息）。
+
+    两类 UUID 不要混淆：
+    - ``uuid``         —— 随机 v4，每条索引条目独立标识（用于点查/删除）
+    - ``corpus_uuid``  —— 确定性 v5，由 LoadedDoc.corpus_uuid 透传而来，
+                          标识「这条索引来自哪篇语料」，便于按语料聚合/失效缓存
+    """
 
     uuid: str = Field(default_factory=lambda: str(uuid.uuid4()))
     character_name: str
@@ -57,6 +63,7 @@ class NameIndexEntry(BaseModel):
     category: IndexCategory
     text: str = Field(..., description="原文片段（已 copy 到该条独立存储）")
     source: str = Field(..., description="来源文件 relpath")
+    corpus_uuid: str = Field(default="", description="所属语料的确定性 UUID")
     char_start: int = 0
     char_end: int = 0
     chunk_index: int = 0
@@ -70,14 +77,20 @@ class NameIndexEntry(BaseModel):
         chunk_index: int,
         source: str,
         global_char_start: int = 0,
+        corpus_uuid: str = "",
     ) -> "NameIndexEntry":
-        """从 LLM 输出 + 分块定位构造索引条目。"""
+        """从 LLM 输出 + 分块定位构造索引条目。
+
+        ``corpus_uuid`` 由调用方从 ``LoadedDoc.corpus_uuid`` 透传，
+        不传则留空（向后兼容旧调用点）。
+        """
         return cls(
             character_name=m.name,
             aliases=list(m.aliases),
             category=m.category,
             text=m.evidence,
             source=source,
+            corpus_uuid=corpus_uuid,
             chunk_index=chunk_index,
             char_start=global_char_start + m.char_start,
             char_end=global_char_start + m.char_end,
@@ -90,6 +103,7 @@ class NameIndexEntry(BaseModel):
             "character_name": self.character_name,
             "category": self.category.value,
             "source": self.source,
+            "corpus_uuid": self.corpus_uuid,
             "chunk_index": self.chunk_index,
             "char_start": self.char_start,
             "char_end": self.char_end,

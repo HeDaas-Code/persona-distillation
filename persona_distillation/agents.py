@@ -34,6 +34,7 @@ from persona_distillation.prompts import (
     ORCHESTRATOR_SYSTEM,
     PROFILE_BUILDER_SYSTEM,
     dialogue_writer_system,
+    intake_orchestrator_system,
     skill_designer_system,
     synthesizer_system,
 )
@@ -70,6 +71,17 @@ def build_model(cfg: DistillationConfig) -> str | BaseChatModel:
     import os
 
     from langchain_openai import ChatOpenAI
+
+    # 归一化代理 scheme：httpx 只认 socks5:// / socks4://，不认 socks://。
+    # Clash 等 GUI 代理工具常把 ALL_PROXY 设成 socks://（缺版本号），导致
+    # ChatOpenAI 构造时 httpx 抛 "Unknown scheme for proxy URL"。
+    # 这里把 socks:// 统一改成 socks5://，不影响其它环境。
+    for _var in ("ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY",
+                 "all_proxy", "http_proxy", "https_proxy"):
+        _val = os.environ.get(_var, "")
+        if _val.startswith("socks://"):
+            os.environ[_var] = "socks5://" + _val[len("socks://"):]
+            logger.debug("代理 scheme 归一化: %s socks:// → socks5://", _var)
 
     model_name = model.split(":", 1)[1]
     api_key = os.environ.get(cfg.minimax_api_key_env, "")
@@ -287,19 +299,32 @@ def build_intake_orchestrator(
     *,
     middleware: list[AgentMiddleware] | None = None,
 ) -> Any:
-    """主理人 Agent：3 个 intake 子 agent + 框架 skill + 工具。
+    """主理人 Agent：真实工具（load_corpus / IndexStore / distill_character）+ 框架 skill。
 
     入口是交互式 REPL，由用户自然语言驱动。
+
+    设计说明：
+    - 不再注册 intake_ner / profile_builder / bridger 子 agent——它们的职责已被
+      :mod:`persona_distillation.intake.tools` 里的工具覆盖，且工具走确定性 Python
+      编排（函数内部再调 LLM），比让 LLM 逐块委派子 agent 更稳定。
+    - 工具闭包共享同一个 :class:`IntakeContext`（IndexStore / llm / workdir），
+      跨工具调用状态一致。
+    - ``FilesystemMiddleware`` 默认的 StateBackend 是内存虚拟 FS，无法读真实磁盘；
+      摄入语料必须走 ``load_text`` / ``intake_corpus`` 工具，不能依赖 ``ls``/``read_file``。
+      这一点已写入 system prompt。
     """
-    workdir = cfg.resolve_workdir()
-    skills_dir = write_distillation_skill(workdir / "skills")
+    from persona_distillation.intake.tools import build_intake_context, build_intake_tools
+
+    ctx = build_intake_context(cfg)
+    tools = build_intake_tools(ctx)
+    skills_dir = write_distillation_skill(ctx.workdir / "skills")
     extra = list(cfg.extra_skills_dirs or [])
     skills = [skills_dir, *extra]
 
     return create_deep_agent(
         model=build_model(cfg),
-        system_prompt=INTAKE_ORCHESTRATOR_SYSTEM,
-        subagents=build_intake_subagents(cfg),
+        system_prompt=intake_orchestrator_system(ctx.workdir),
+        tools=tools,
         skills=skills,
         middleware=middleware or (),
         checkpointer=False,
