@@ -1,4 +1,4 @@
-"""蒸馏输入/输出的结构化 schema。
+"""Pydantic 数据契约：所有跨模块流动的数据结构都在这里定义。
 
 字段命名与角色卡暗色界面一一对应：
 - ``PersonaCard.persona_id``      → 左侧"人格ID"
@@ -6,14 +6,31 @@
 - ``PersonaCard.error_reply``     → 左侧"自定义报错回复信息"
 - ``PersonaSkill``                → 右侧"Skills 选择"
 - ``PresetDialogue``              → 右侧"预设对话"
+
+DNA 五层（均在 :class:`PersonaCard` / :class:`PersonaSkill` 中）：
+:class:`ExpressionDNA` / :class:`MentalModel` / :class:`DecisionHeuristic`
+/ :class:`AntiPattern` / :class:`HonestBoundary`
 """
 from __future__ import annotations
 
+import json
+import logging
+import uuid
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+logger = logging.getLogger(__name__)
+
+
+# 当前 schema 版本号。修改任何持久化模型字段时必须 bump 该值。
+SCHEMA_VERSION = 1
+
+
+class SchemaVersionError(ValueError):
+    """加载数据时 schema_version 与当前不匹配。"""
 
 
 class SignalCategory(str, Enum):
@@ -136,6 +153,7 @@ class ExpressionDNA(BaseModel):
 class Distillate(BaseModel):
     """单个分块的"蒸馏液"——分馏阶段的一次产出。"""
 
+    schema_version: int = Field(default=SCHEMA_VERSION, description="schema 版本号")
     source_file: str
     chunk_index: int
     char_start: int
@@ -151,10 +169,17 @@ class PersonaCard(BaseModel):
     ``persona_id`` 同时用作落盘子目录名。
     """
 
+    # P0 红线：LLM 经常塞 schema 外字段（如 ``tools`` / ``skills``），
+    # 一律拒绝，让前端/上游调用方显式收敛。
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = Field(default=SCHEMA_VERSION, description="schema 版本号")
     persona_id: str = Field(..., description="人格ID，小写字母/数字/连字符")
     display_name: str = ""
     system_prompt: str = Field(..., description="系统提示词（完整可注入）")
-    error_reply: str = Field(..., description="LLM 请求失败时的自定义报错回复")
+    error_reply: str = Field(
+        default="", description="LLM 请求失败时的自定义报错回复（可空，pipeline 兜底）"
+    )
     tags: list[str] = Field(default_factory=list)
     traits_summary: str = Field("", description="供下游 skills/对话阶段复用的特质摘要")
     # DNA 汇总：从 distillates 提纯得到，供 skill_designer 复用
@@ -163,6 +188,29 @@ class PersonaCard(BaseModel):
     decision_heuristics: list[DecisionHeuristic] = Field(default_factory=list)
     anti_patterns: list[AntiPattern] = Field(default_factory=list)
     honest_boundaries: list[HonestBoundary] = Field(default_factory=list)
+
+    def model_post_init(self, __context: Any) -> None:
+        # P1: DNA 完整性检查——5 字段全空时报 WARNING，提示后处理回填
+        edna_empty = (
+            not self.expression_dna.vocabulary
+            and not self.expression_dna.rhythm
+            and not self.expression_dna.rhetorical_tics
+            and not self.expression_dna.signature_metaphors
+            and not self.expression_dna.opening_samples
+        )
+        all_empty = (
+            edna_empty
+            and len(self.mental_models) == 0
+            and len(self.decision_heuristics) == 0
+            and len(self.anti_patterns) == 0
+            and len(self.honest_boundaries) == 0
+        )
+        if all_empty:
+            logger.warning(
+                "PersonaCard(persona_id=%s) DNA 字段全空, system_prompt 长度=%d; 建议后处理回填",
+                self.persona_id,
+                len(self.system_prompt or ""),
+            )
 
 
 class PersonaSkill(BaseModel):
@@ -175,6 +223,7 @@ class PersonaSkill(BaseModel):
     可被 deepagents 的 ``SkillsMiddleware`` 直接加载。
     """
 
+    schema_version: int = Field(default=SCHEMA_VERSION, description="schema 版本号")
     name: str = Field(..., description="小写字母数字与连字符，≤64字符")
     description: str = Field(..., description="该 skill 做什么，≤1024字符")
     when_to_use: str = ""
@@ -195,6 +244,7 @@ class PersonaSkill(BaseModel):
 class PresetDialogue(BaseModel):
     """预设对话——对应界面右侧"预设对话"的一组对话对。"""
 
+    schema_version: int = Field(default=SCHEMA_VERSION, description="schema 版本号")
     user: str
     assistant: str
     intent: str = Field("", description="该对话对展示的人格侧重点")
@@ -203,6 +253,7 @@ class PresetDialogue(BaseModel):
 class DistillationResult(BaseModel):
     """一次完整蒸馏的最终产物。"""
 
+    schema_version: int = Field(default=SCHEMA_VERSION, description="schema 版本号")
     persona_card: PersonaCard
     skills: list[PersonaSkill] = Field(default_factory=list)
     preset_dialogues: list[PresetDialogue] = Field(default_factory=list)
@@ -233,15 +284,28 @@ class DistillationResult(BaseModel):
             self.model_dump_json(indent=2, exclude={"distillates"}),
             encoding="utf-8",
         )
+        logger.info("distillation_result saved to %s", out)
         return out
 
     @classmethod
     def load(cls, path: str | Path) -> "DistillationResult":
-        import json
-
+        """从 ``distillation_result.json`` 加载（带 schema 版本校验）。"""
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+
+        # 1. schema_version 校验（P1-3）
+        ver = data.get("schema_version")
+        if ver is None:
+            # 旧文件无版本号，假定 v1（兼容期）
+            logger.warning("加载的 distillation_result.json 无 schema_version 字段，假定 v%d", SCHEMA_VERSION)
+            data["schema_version"] = SCHEMA_VERSION
+        elif ver != SCHEMA_VERSION:
+            raise SchemaVersionError(
+                f"schema_version 不匹配：文件={ver}，当前={SCHEMA_VERSION}。"
+                f" 请运行 migration 或重新蒸馏。"
+            )
+
         try:
             return cls.model_validate(data)
         except ValidationError:
             # 兼容只存了 persona_card 的情况
-            return cls.model_validate({"persona_card": data})
+            return cls.model_validate({"persona_card": data, "schema_version": SCHEMA_VERSION})

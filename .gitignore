@@ -18,7 +18,7 @@ env/
 .idea/
 *.swp
 *.swo
-
+.trae/
 # 蒸馏产物（含可能的 API 调用缓存）
 out/
 *.png

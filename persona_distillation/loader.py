@@ -8,14 +8,20 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 _TEXT_EXTS = {
     ".txt", ".md", ".markdown", ".rst", ".log",
     ".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml",
 }
+
+# P2-1: 默认单文件输入大小上限（MB）。可通过 load_corpus(max_mb=...) 覆盖。
+DEFAULT_MAX_INPUT_MB = 100
 
 
 @dataclass
@@ -104,8 +110,25 @@ _EXT_LOADERS: dict[str, Callable[[Path], str]] = {
 }
 
 
-def load_corpus(input_path: str | Path) -> list[LoadedDoc]:
+def _check_size(p: Path, max_mb: int) -> None:
+    """P2-1: 大小上限校验。max_mb <= 0 表示不限制。"""
+    if max_mb <= 0:
+        return
+    size_mb = p.stat().st_size / (1024 * 1024)
+    if size_mb > max_mb:
+        logger.error("文件 %s 大小 %.1f MB 超过上限 %d MB", p, size_mb, max_mb)
+        raise ValueError(
+            f"文件 {p} 大小 {size_mb:.1f} MB 超过上限 {max_mb} MB。"
+            f" 使用 load_corpus(input_path, max_mb=0) 禁用上限。"
+        )
+
+
+def load_corpus(input_path: str | Path, max_mb: int = DEFAULT_MAX_INPUT_MB) -> list[LoadedDoc]:
     """加载文件或目录，返回文档列表。
+
+    Parameters:
+        input_path: 文件或目录路径
+        max_mb: 单文件大小上限（MB）。0 表示不限制。默认 100。
 
     多模态聚合语义：每个文件独立成篇，后续由分块器与蒸馏流水线分别处理，
     最终在合成阶段聚合为统一人格卡。
@@ -115,14 +138,17 @@ def load_corpus(input_path: str | Path) -> list[LoadedDoc]:
         raise FileNotFoundError(f"输入路径不存在: {root}")
 
     if root.is_file():
+        _check_size(root, max_mb)
         docs = [_load_one(root, root.parent)]
     else:
         docs: list[LoadedDoc] = []
         for p in sorted(root.rglob("*")):
             if p.is_file() and p.suffix.lower() in _EXT_LOADERS:
+                _check_size(p, max_mb)
                 docs.append(_load_one(p, root))
     if not docs:
         raise ValueError(f"未在 {root} 找到任何可加载的文本文件，支持的后缀: {sorted(_TEXT_EXTS)}")
+    logger.info("load_corpus: 加载了 %d 个文件 (max_mb=%d)", len(docs), max_mb)
     return docs
 
 

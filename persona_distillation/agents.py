@@ -1,36 +1,48 @@
-"""DeepAgents 子智能体与主智能体工厂。
+"""DeepAgents 工厂：把 LLM 模型转成可调用的 agent 图。
 
-提供两种使用方式：
-
-1. **自主编排模式** —— :func:`build_orchestrator` 返回一个带四个子智能体
-   （extractor / synthesizer / skill_designer / dialogue_writer）与"蒸馏 skill"
-   的主 deepagent，由其自行用 ``task`` 工具调度。适合交互式/探索性蒸馏。
-
-2. **确定性流水线模式** —— :func:`build_extractor_agent` 等返回各阶段独立
-   deepagent，配合 :class:`~persona_distillation.pipeline.PersonaDistiller`
-   按序调用、强制 ``response_format`` 结构化产出。适合可复现的批量蒸馏。
+对外接口：
+- :func:`build_orchestrator`         —— 顶层 deepagent（含 4 个子 agent + skill）
+- :func:`build_extractor_agent`      —— Stage 1 蒸馏
+- :func:`build_synthesizer_agent`    —— Stage 2-3 冷凝 + 提纯
+- :func:`build_skill_designer_agent` —— Stage 4a 技能设计
+- :func:`build_dialogue_writer_agent`—— Stage 4b 对话撰写
+- :func:`build_intake_orchestrator`  —— 主理人 Agent（intake 子包入口）
+- :func:`invoke_structured`          —— 通用 LLM 调用 + 结构化输出包装
 """
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 from typing import Any
 
-from deepagents import SubAgent, create_deep_agent
-from langchain.agents.middleware import AgentMiddleware
+logger = logging.getLogger(__name__)
+
 from langchain_core.language_models import BaseChatModel
+from deepagents import create_deep_agent
+from deepagents.middleware import SubAgent
+from langchain.agents.middleware import AgentMiddleware
 
 from persona_distillation.config import DistillationConfig
 from persona_distillation.prompts import (
+    BRIDGER_SYSTEM,
     DISTILLATION_SKILL_MD,
     DIALOGUE_WRITER_SYSTEM,
     EXTRACTOR_SYSTEM,
+    INTAKE_NER_SYSTEM,
+    INTAKE_ORCHESTRATOR_SYSTEM,
     ORCHESTRATOR_SYSTEM,
+    PROFILE_BUILDER_SYSTEM,
     dialogue_writer_system,
     skill_designer_system,
     synthesizer_system,
 )
 from pydantic import BaseModel
 
+from persona_distillation.intake.schemas import (
+    CharacterProfile,
+    NameExtractionResult,
+)
 from persona_distillation.schemas import (
     Distillate,
     PersonaCard,
@@ -62,9 +74,12 @@ def build_model(cfg: DistillationConfig) -> str | BaseChatModel:
     model_name = model.split(":", 1)[1]
     api_key = os.environ.get(cfg.minimax_api_key_env, "")
     if not api_key:
+        # P0-2: 清晰的错误信息，引导用户快速修复
+        logger.error("未设置环境变量 %s", cfg.minimax_api_key_env)
         raise RuntimeError(
             f"未设置环境变量 {cfg.minimax_api_key_env}；请在 "
-            f"https://platform.minimax.io 获取后 export {cfg.minimax_api_key_env}=..."
+            f"https://api.minimax.io 获取后 export {cfg.minimax_api_key_env}=... "
+            f"（或设置 cfg.dry_run=True 跳过校验用于测试）"
         )
     return ChatOpenAI(
         model=model_name,
@@ -234,14 +249,138 @@ def build_dialogue_writer_agent(cfg: DistillationConfig) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# intake 子包：主理人 Agent + 3 个子智能体
+# ---------------------------------------------------------------------------
+def build_intake_subagents(cfg: DistillationConfig) -> list[SubAgent]:
+    """返回 3 个 intake 子智能体。"""
+    return [
+        SubAgent(
+            name="intake_ner",
+            description=(
+                "对单分块做人物识别与分类：识别所有人物 + 规范化名字 + 标注 "
+                "speech/appearance/event 类别，产出 NameExtractionResult。"
+            ),
+            system_prompt=INTAKE_NER_SYSTEM,
+            response_format=NameExtractionResult,  # type: ignore[call-arg]
+        ),
+        SubAgent(
+            name="profile_builder",
+            description=(
+                "从 IndexStore 拉取单人物索引条目，跨类别重排序，撰写 ≤200 字人物档案。"
+            ),
+            system_prompt=PROFILE_BUILDER_SYSTEM,
+            response_format=CharacterProfile,  # type: ignore[call-arg]
+        ),
+        SubAgent(
+            name="bridger",
+            description=(
+                "接收 CharacterProfile 调工具完成蒸馏桥接：重建临时语料目录 + 启动 PersonaDistiller。"
+            ),
+            system_prompt=BRIDGER_SYSTEM,
+            # 不强制 response_format：bridger 的产出是落盘的文件路径
+        ),
+    ]
+
+
+def build_intake_orchestrator(
+    cfg: DistillationConfig,
+    *,
+    middleware: list[AgentMiddleware] | None = None,
+) -> Any:
+    """主理人 Agent：3 个 intake 子 agent + 框架 skill + 工具。
+
+    入口是交互式 REPL，由用户自然语言驱动。
+    """
+    workdir = cfg.resolve_workdir()
+    skills_dir = write_distillation_skill(workdir / "skills")
+    extra = list(cfg.extra_skills_dirs or [])
+    skills = [skills_dir, *extra]
+
+    return create_deep_agent(
+        model=build_model(cfg),
+        system_prompt=INTAKE_ORCHESTRATOR_SYSTEM,
+        subagents=build_intake_subagents(cfg),
+        skills=skills,
+        middleware=middleware or (),
+        checkpointer=False,
+        debug=cfg.debug,
+        name="persona-intake-conductor",
+    )
+
+
+# ---------------------------------------------------------------------------
 # 调用 helper：兼容 structured_response 与消息内容两种返回
 # ---------------------------------------------------------------------------
+# P1-1: 重试装饰器（带指数回退 + 抖动）—— 仅依赖标准库，避免引入 tenacity
+import random
+import time as _time
+from functools import wraps
+from typing import Callable
+
+
+_RETRYABLE_EXCEPTIONS = (
+    ConnectionError,
+    TimeoutError,
+    OSError,
+)
+
+
+def _retry_with_backoff(
+    max_attempts: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 8.0,
+    enabled: bool = True,
+):
+    """指数回退 + 抖动重试装饰器。
+
+    适用于：瞬时网络错误、超时、限流。仅依赖标准库。
+    """
+
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if not enabled:
+                return func(*args, **kwargs)
+            last_exc: Exception | None = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except _RETRYABLE_EXCEPTIONS as e:
+                    last_exc = e
+                    if attempt >= max_attempts:
+                        break
+                    delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                    delay += random.uniform(0, 0.3)  # 抖动
+                    logger.warning(
+                        "LLM call %s 第 %d/%d 次失败 (%s: %s)，%.2fs 后重试",
+                        getattr(func, "__name__", "<func>"),
+                        attempt,
+                        max_attempts,
+                        type(e).__name__,
+                        e,
+                        delay,
+                    )
+                    _time.sleep(delay)
+            # 全部失败
+            logger.error("LLM call 重试 %d 次后仍失败：%s", max_attempts, last_exc)
+            assert last_exc is not None
+            raise last_exc
+
+        return wrapper
+
+    return decorator
+
+
 def invoke_structured(agent: Any, user_prompt: str, expected_type: type) -> Any:
     """调用 deepagent 并取回结构化结果。
 
     优先读 ``structured_response``；若缺失则尝试把最后一条 AIMessage 内容解析为 JSON。
+    内部使用 :func:`_retry_with_backoff` 处理瞬时 LLM 失败。
     """
-    result = agent.invoke({"messages": [{"role": "user", "content": user_prompt}]})
+    # P1-1: 重试
+    result = _retry_with_backoff(max_attempts=3, base_delay=1.0)(
+        lambda: agent.invoke({"messages": [{"role": "user", "content": user_prompt}]})
+    )()
     sr = result.get("structured_response")
     if sr is not None:
         if isinstance(sr, expected_type):
@@ -265,7 +404,12 @@ def invoke_structured(agent: Any, user_prompt: str, expected_type: type) -> Any:
         if 0 <= start < end:
             try:
                 return expected_type.model_validate(json.loads(content[start : end + 1]))
-            except Exception:
+            except json.JSONDecodeError as e:
+                logger.warning("JSON 解析失败 (尝试最后一条消息): %s", e)
+                continue
+            except Exception as e:  # noqa: BLE001
+                # 校验失败等也记录而非静默
+                logger.warning("Pydantic 校验失败 (尝试最后一条消息): %s", e)
                 continue
     raise ValueError(
         f"未能从 agent 返回中解析出 {expected_type.__name__}；原始 keys={list(result.keys())}"

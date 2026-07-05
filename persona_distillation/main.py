@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from persona_distillation.config import DistillationConfig
 from persona_distillation.pipeline import PersonaDistiller
@@ -44,7 +47,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     p = Path(args.path)
     result_path = p / "distillation_result.json" if p.is_dir() else p
     if not result_path.exists():
-        print(f"找不到结果文件: {result_path}", file=sys.stderr)
+        logger.error("找不到结果文件: %s", result_path)
         return 1
     result = DistillationResult.load(result_path)
     _print_summary(result, result_path.parent if p.is_dir() else p)
@@ -70,6 +73,64 @@ def _print_summary(result: DistillationResult, out: Path) -> None:
     print("  - preset_dialogues.json 预设对话")
     print("  - distillates.jsonl     分馏液（可审计）")
     print("  - skills/<name>/SKILL.md 人格 Skills")
+
+
+def _cmd_chat(args: argparse.Namespace) -> int:
+    """启动主理人 Agent（交互式 REPL）。"""
+    from persona_distillation.agents import build_intake_orchestrator
+
+    cfg = DistillationConfig(
+        model=args.model,
+        workdir=args.workdir,
+        embedding_model=args.embedding_model,
+        rerank_model=args.rerank_model,
+        intake_chunk_size=args.chunk_size,
+        intake_chunk_overlap=args.chunk_overlap,
+        offline=args.offline,
+        debug=args.debug,
+    )
+    try:
+        agent = build_intake_orchestrator(cfg)
+    except Exception as e:
+        logger.error("主理人 Agent 启动失败: %s", e, exc_info=True)
+        return 1
+
+    workdir = Path(args.workdir).resolve()
+    print("=" * 60)
+    print(f"  人格蒸馏 · 主理人 Agent  已就绪")
+    print(f"  模型: {args.model}    工作目录: {workdir}")
+    print(f"  退出: 输入 退出 / quit / exit")
+    print("=" * 60)
+
+    while True:
+        try:
+            user_input = input("\n[你] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[主理人] 再见。")
+            return 0
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit", "退出", "切回正常", "不用扮演了"):
+            print("[主理人] 再见。")
+            return 0
+        try:
+            result = agent.invoke(
+                {"messages": [{"role": "user", "content": user_input}]}
+            )
+        except Exception as e:
+            logger.error("主理人 Agent 调用出错: %s", e, exc_info=True)
+            continue
+        messages = result.get("messages") or []
+        if messages:
+            content = getattr(messages[-1], "content", "") or ""
+            if isinstance(content, list):
+                content = "".join(
+                    b.get("text", "") if isinstance(b, dict) else str(b)
+                    for b in content
+                )
+            print(f"\n[主理人] {content}")
+    # unreachable
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,6 +159,17 @@ def build_parser() -> argparse.ArgumentParser:
     ins = sub.add_parser("inspect", help="查看已蒸馏结果")
     ins.add_argument("path", help="结果目录或 distillation_result.json")
     ins.set_defaults(func=_cmd_inspect)
+
+    chat = sub.add_parser("chat", help="启动主理人 Agent（交互式蒸馏）")
+    chat.add_argument("--model", default="minimax:MiniMax-M3", help="模型字符串")
+    chat.add_argument("--workdir", default="./intake_workdir", help="工作目录")
+    chat.add_argument("--embedding-model", default="BAAI/bge-m3", help="嵌入模型")
+    chat.add_argument("--rerank-model", default="BAAI/bge-reranker-base", help="重排序模型")
+    chat.add_argument("--chunk-size", type=int, default=1200, help="intake 分块大小")
+    chat.add_argument("--chunk-overlap", type=int, default=120, help="intake 分块重叠")
+    chat.add_argument("--offline", action="store_true", help="离线模式（用伪 embedding）")
+    chat.add_argument("--debug", action="store_true")
+    chat.set_defaults(func=_cmd_chat)
     return parser
 
 

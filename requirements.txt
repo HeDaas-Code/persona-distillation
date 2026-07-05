@@ -6,3 +6,8 @@ langchain-anthropic>=1.0.0
 openai>=1.50.0
 pydantic>=2.0
 tiktoken>=0.7
+
+# 索引 / 嵌入 / 重排序（intake 子包使用）
+chromadb>=0.5.0
+langchain-chroma>=0.1.0
+sentence-transformers>=3.0.0

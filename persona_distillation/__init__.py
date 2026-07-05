@@ -37,6 +37,20 @@ from persona_distillation.pipeline import PersonaDistiller
 from persona_distillation.loader import LoadedDoc, load_corpus
 from persona_distillation.chunker import Chunk, chunk_text
 from persona_distillation.triple_verification import verify_mental_models
+# intake 子包
+from persona_distillation.intake import (
+    CharacterProfile,
+    IndexCategory,
+    IndexStore,
+    NameExtractionResult,
+    NameIndexEntry,
+    NameMention,
+    build_profile,
+    distill_character,
+    extract_names_from_chunk,
+    rebuild_corpus_dir,
+)
+from persona_distillation.agents import build_intake_orchestrator
 
 __all__ = [
     "DistillationConfig",
@@ -60,6 +74,18 @@ __all__ = [
     "AntiPattern",
     "HonestBoundary",
     "verify_mental_models",
+    # intake 子包
+    "IndexCategory",
+    "NameMention",
+    "NameExtractionResult",
+    "NameIndexEntry",
+    "CharacterProfile",
+    "IndexStore",
+    "extract_names_from_chunk",
+    "build_profile",
+    "rebuild_corpus_dir",
+    "distill_character",
+    "build_intake_orchestrator",
 ]
 
 __version__ = "0.1.0"

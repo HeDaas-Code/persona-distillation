@@ -22,23 +22,17 @@ def render_persona_card(result: DistillationResult, out: Path) -> Path:
     card = result.persona_card
 
     # 1. 角色卡 JSON（字段对齐界面左侧）
-    card_payload = {
-        "persona_id": card.persona_id,
-        "display_name": card.display_name,
-        "system_prompt": card.system_prompt,
-        "error_reply": card.error_reply,
-        "tags": card.tags,
-        "traits_summary": card.traits_summary,
-        # 右侧三块选择默认值，便于直接导入平台
-        "tools": {"mode": "default_all"},
-        "skills": {
-            "mode": "specified",
-            "paths": [f"skills/{s.name}/" for s in result.skills],
-            "names": [s.name for s in result.skills],
-        },
-        "preset_dialogues": [d.model_dump() for d in result.preset_dialogues],
-        "metadata": result.metadata,
+    # 用 model_dump 拿到全部字段（包括 DNA 五层），再叠加右侧三块选择默认值
+    card_payload = card.model_dump(exclude_none=True)
+    # 右侧三块选择默认值，便于直接导入平台
+    card_payload["tools"] = {"mode": "default_all"}
+    card_payload["skills"] = {
+        "mode": "specified",
+        "paths": [f"skills/{s.name}/" for s in result.skills],
+        "names": [s.name for s in result.skills],
     }
+    card_payload["preset_dialogues"] = [d.model_dump() for d in result.preset_dialogues]
+    card_payload["metadata"] = result.metadata
     (out / "persona_card.json").write_text(
         json.dumps(card_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",

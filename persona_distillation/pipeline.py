@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from persona_distillation.agents import (
     PersonaSkillList,
@@ -69,25 +72,25 @@ class PersonaDistiller:
 
         t0 = time.time()
         docs = load_corpus(input_path)
-        print(f"[distill] 加载 {len(docs)} 篇文档")
+        logger.info("加载 %d 篇文档", len(docs))
 
         # ---- Stage 1: 分馏 ----
         distillates = self._fractional_distillation(docs)
-        print(f"[distill] 分馏完成，共 {len(distillates)} 个分块的蒸馏液")
+        logger.info("分馏完成，共 %d 个分块的蒸馏液", len(distillates))
 
         # ---- Stage 2 & 3: 冷凝 + 提纯 ----
         persona_card = self._condense_and_purify(distillates)
         # 三重验证：过滤未通过的心智模型（宁缺毋滥）
         persona_card = self._verify_mental_models(persona_card, distillates)
-        print(f"[distill] 提纯完成，persona_id={persona_card.persona_id}")
+        logger.info("提纯完成，persona_id=%s", persona_card.persona_id)
 
         # ---- Stage 4a: Skills ----
         skills = self._design_skills(persona_card)
-        print(f"[distill] 设计 {len(skills)} 个 Skills")
+        logger.info("设计 %d 个 Skills", len(skills))
 
         # ---- Stage 4b: 预设对话 ----
         dialogues = self._author_dialogues(persona_card)
-        print(f"[distill] 撰写 {len(dialogues)} 组预设对话")
+        logger.info("撰写 %d 组预设对话", len(dialogues))
 
         result = DistillationResult(
             persona_card=persona_card,
@@ -105,7 +108,7 @@ class PersonaDistiller:
 
         if output_dir is not None:
             result.save(output_dir)
-            print(f"[distill] 已落盘到 {Path(output_dir)}")
+            logger.info("已落盘到 %s", Path(output_dir))
         return result
 
     # ------------------------------------------------------------------
@@ -128,7 +131,9 @@ class PersonaDistiller:
                 try:
                     dist = invoke_structured(agent, prompt, Distillate)
                 except Exception as e:
-                    print(f"[extractor] {doc.relpath}#{ch.index} 失败: {e}")
+                    logger.warning(
+                        "extractor %s#%d 失败: %s", doc.relpath, ch.index, e
+                    )
                     continue
                 # 校正定位字段，确保与原文一致
                 dist = dist.model_copy(
@@ -179,6 +184,19 @@ class PersonaDistiller:
         # 若用户强指定 persona_id，覆盖之
         if self.cfg.persona_id:
             card = card.model_copy(update={"persona_id": self.cfg.persona_id})
+        # ---- P1: DNA 结构化字段回填 ----
+        # 某些 LLM 端点（典型如 MiniMax-M3）会把 DNA 五层
+        # 拼到 system_prompt 文本里，导致顶层字段全空。
+        # 这里从 system_prompt 反向解析并填充（已有内容时 no-op）。
+        try:
+            from persona_distillation.intake.dna_extractor import (
+                backfill_dna_from_system_prompt,
+            )
+            card = backfill_dna_from_system_prompt(card)
+        except Exception:
+            logger.warning(
+                "pipeline._condense_and_purify: backfill_dna_from_system_prompt 失败, exc_info=True",
+            )
         return card
 
     @staticmethod
@@ -213,9 +231,11 @@ class PersonaDistiller:
         passed, reports = filter_verified(card.mental_models, distillates)
         dropped = len(card.mental_models) - len(passed)
         if dropped:
-            print(
-                f"[verify] 三重验证：{len(card.mental_models)} 个候选 → "
-                f"通过 {len(passed)} 个，丢弃 {dropped} 个"
+            logger.info(
+                "三重验证：%d 个候选 → 通过 %d 个，丢弃 %d 个",
+                len(card.mental_models),
+                len(passed),
+                dropped,
             )
         # 把验证证据写回（filter_verified 会更新 verification 字段）
         return card.model_copy(update={"mental_models": passed})
