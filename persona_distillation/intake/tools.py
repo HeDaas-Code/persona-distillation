@@ -33,7 +33,15 @@ from persona_distillation.intake.name_extractor import extract_names_from_chunk
 from persona_distillation.intake.progress import ProgressReporter
 from persona_distillation.intake.schemas import NameIndexEntry
 from persona_distillation.intake.profile_builder import build_profile as _build_profile
-from persona_distillation.intake.bridge import distill_character as _distill_character
+from persona_distillation.intake.bridge import (
+    distill_character as _distill_character,
+    slugify,
+)
+from persona_distillation.intake.oc_writer import (
+    OCSetting,
+    generate_oc_corpus as _generate_oc_corpus,
+)
+from persona_distillation.intake.interview import run_interview as _run_interview
 
 logger = logging.getLogger(__name__)
 
@@ -465,6 +473,108 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
             logger.error("蒸馏失败: %s", e, exc_info=True)
             return f"蒸馏失败: {e}\n（详见日志；可重试或换个人物）"
 
+    @tool
+    def generate_oc_corpus(setting_json: str) -> str:
+        """从 OC 设定生成骨架语料（独白/对话/事件/回忆 4 类）。
+
+        用于 OC 共创蒸馏 Phase 1。setting_json 是一段 JSON 字符串，需含：
+        name / age / background / traits / worldview / catchphrase 六字段。
+
+        4 类文本落到 <workdir>/<persona_id>/oc_corpus/，完成后可调
+        run_character_interview 完善血肉，再调 distill_character 蒸馏。
+        """
+        # 解析 OC 设定 JSON → OCSetting
+        try:
+            setting = OCSetting.model_validate_json(setting_json)
+        except Exception as e:  # noqa: BLE001
+            return (
+                f"OC 设定解析失败: {e}\n"
+                "setting_json 需含 name/age/background/traits/worldview/catchphrase 六字段。"
+            )
+
+        # 离线模式兜底：没有 LLM 就无法生成
+        if ctx.llm is None:
+            return (
+                "当前为离线模式（无可用 LLM），无法生成 OC 骨架语料。\n"
+                "请配置 DistillationConfig.model 后重试。"
+            )
+
+        persona_id = slugify(setting.name)
+        try:
+            result = _generate_oc_corpus(setting, ctx.workdir, persona_id, ctx.llm)
+        except Exception as e:  # noqa: BLE001
+            logger.error("OC 骨架生成失败: %s", e, exc_info=True)
+            return f"OC 骨架生成失败: {e}\n（详见日志；可重试）"
+
+        paths = result.get("paths", {})
+        word_counts = result.get("word_counts", {})
+        corpus_dir = result.get("corpus_dir", "")
+        lines = [
+            f"OC 骨架生成完成 · {setting.name}",
+            f"  人格ID: {persona_id}",
+            f"  骨架目录: {corpus_dir}",
+        ]
+        for key in ("monologue", "dialogue", "event", "memory"):
+            if key in paths:
+                lines.append(f"  - {key}: {word_counts.get(key, 0)} 字 → {paths[key]}")
+        lines.append(
+            "下一步：调 run_character_interview 完善血肉，再调 distill_character 蒸馏。"
+        )
+        return "\n".join(lines)
+
+    @tool
+    def run_character_interview(setting_json: str, n_rounds: int = 8) -> str:
+        """基于 OC 骨架对 OC 做访谈，完善角色血肉。
+
+        用于 OC 共创蒸馏 Phase 2。需先调 generate_oc_corpus 生成骨架。
+        setting_json 同 generate_oc_corpus（name/age/background/traits/worldview/catchphrase）。
+        n_rounds 默认 8。
+
+        访谈记录落 <workdir>/<persona_id>/interview.md，完成后调 distill_character 蒸馏。
+        """
+        # 解析 OC 设定 JSON → OCSetting
+        try:
+            setting = OCSetting.model_validate_json(setting_json)
+        except Exception as e:  # noqa: BLE001
+            return (
+                f"OC 设定解析失败: {e}\n"
+                "setting_json 需含 name/age/background/traits/worldview/catchphrase 六字段。"
+            )
+
+        # 离线模式兜底：没有 LLM 就无法访谈
+        if ctx.llm is None:
+            return (
+                "当前为离线模式（无可用 LLM），无法执行角色访谈。\n"
+                "请配置 DistillationConfig.model 后重试。"
+            )
+
+        persona_id = slugify(setting.name)
+        try:
+            result = _run_interview(setting, n_rounds, ctx.workdir, persona_id, ctx.llm)
+        except FileNotFoundError as e:
+            # 骨架不存在：引导先调 generate_oc_corpus
+            return (
+                f"骨架不存在: {e}\n"
+                "请先调 generate_oc_corpus 生成骨架后再访谈。"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("OC 访谈失败: %s", e, exc_info=True)
+            return f"OC 访谈失败: {e}\n（详见日志；可重试）"
+
+        path = result.get("path", "")
+        rounds = result.get("rounds", n_rounds)
+        distill_dir = ctx.workdir / persona_id
+        lines = [
+            f"OC 访谈完成 · {setting.name}",
+            f"  人格ID: {persona_id}",
+            f"  轮数: {rounds}",
+            f"  访谈记录: {path}",
+            f"  蒸馏目录: {distill_dir}",
+            "下一步：调 distill_character 启动蒸馏"
+            f"（蒸馏输入目录 {distill_dir}/，loader 会递归读取 oc_corpus/ + interview.md）。",
+        ]
+        return "\n".join(lines)
+
     return [
         load_text,
         intake_corpus,
@@ -472,6 +582,8 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
         search_index,
         build_profile,
         distill_character,
+        generate_oc_corpus,
+        run_character_interview,
     ]
 
 

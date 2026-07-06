@@ -11,3 +11,6 @@ tiktoken>=0.7
 chromadb>=0.5.0
 langchain-chroma>=0.1.0
 sentence-transformers>=3.0.0
+
+# WebUI（webui 子命令）
+gradio>=4.44.0

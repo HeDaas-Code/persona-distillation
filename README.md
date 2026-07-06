@@ -22,7 +22,13 @@
 > - **CLI 直跑模式**（确定性、可复现）—— `distill` 子命令一键完成整套蒸馏。
 > - **主理人 Agent 模式**（交互式）—— `chat` 子命令启动 intake 子包，
 >   先做人物识别 + 索引 + 档案，让用户从候选人物里选一位再蒸馏。
-
+> - **WebUI 调试模式**（可视化）—— `webui` 子命令启动 Gradio 三 Tab 面板：
+>   蒸馏参数表单 + 产物浏览（DNA 五层/Skills/对话）+ 主理人 Agent 对话。
+> - **OC 共创蒸馏模式**（生成式）—— `cocreate` 子命令一键走完三阶段：
+>   4 个 sub-agent 据用户设定的 OC 生成"骨架"文本（独白/对话/事件/回忆）→
+>   character_player sub-agent 接受主理人 N 轮访谈产出"血肉"记录 →
+>   合并语料走现有四阶段蒸馏。适用于想蒸馏一个虚构角色（OC）但手上没有现成语料的场景。
+>
 > **灵感**：Skills 生成逻辑参考 [nuwa-skill](https://github.com/alchaincyf/nuwa-skill) 的认知操作系统方法论——
 > 捕捉的是 _HOW they think_，不是 _WHAT they said_。
 > 每个人格 Skill 是一套可运行的认知操作系统，而非语录合集。
@@ -184,13 +190,17 @@
 | **triple_verification** | `triple_verification.py` | **DNA 三重验证**。跨域复现（distillates 证据复核）+ 生成力 + 排他性，未通过的心智模型一律丢弃 |
 | **renderer** | `renderer.py` | 人格卡渲染。`persona_card.json`（机器可导入）+ `persona_card.md`（人类可读）。用 `model_dump(exclude_none=True)` 一次性写入全部 DNA 字段 |
 | **skills_writer** | `skills_writer.py` | Skills 目录落盘。每个 skill 写成 nuwa 风格 SKILL.md：角色扮演规则 + 回答工作流 + 心智模型（含三重验证证据）+ 决策启发式 + 表达DNA + 反模式 + 诚实边界 |
-| **main** | `main.py` | CLI 入口。`distill` / `inspect` / `chat` 三个子命令 |
+| **main** | `main.py` | CLI 入口。`distill` / `inspect` / `chat` / `webui` 四个子命令 |
+| **webui** | `webui.py` | **Gradio 调试面板**。三 Tab：蒸馏（参数表单+实时日志）/ 产物浏览（DNA 五层+Skills+对话）/ 主理人 Agent 聊天。跨 Gradio 4/5/6 兼容 |
 | **intake / dna_extractor** | `intake/dna_extractor.py` | **DNA Backfill 解析器**。6 类节标题正则（中文方括号 / 全角方括号 / 英文冒号 / Markdown 标题 / 中文圆括号 / 无前导符号）→ 5 字段结构化回填。`backfill_dna_from_system_prompt` 是 DNA 字段丢失的最后一道安全网 |
 | **intake / name_extractor** | `intake/name_extractor.py` | LLM-NER。识别分块中所有人物提及，分类为 speech/appearance/event，附原文证据与起止位置 |
 | **intake / index_store** | `intake/index_store.py` | Chroma + SQLite 双写索引。跨文件聚合人物，支持向量检索 + 类别过滤 |
 | **intake / embedder** | `intake/embedder.py` | 嵌入 + 重排序模型封装。在线走真实 sentence-transformers；离线用 `HashEmbeddings` 兜底 |
 | **intake / profile_builder** | `intake/profile_builder.py` | 人物档案摘要。从索引聚合 top-k 选段，LLM 生成 ≤200 字档案 |
 | **intake / bridge** | `intake/bridge.py` | 桥接蒸馏。`rebuild_corpus_dir` 把档案重建为临时语料；`distill_character` 调 PersonaDistiller 启动四阶段蒸馏 |
+| **intake / oc_writer** | `intake/oc_writer.py` | OC 共创 Phase 1：4 类骨架文本生成（独白/对话/事件/回忆） |
+| **intake / interview** | `intake/interview.py` | OC 共创 Phase 2：character_player 读骨架 + 主理人 N 轮访谈 |
+| **intake / tools** | `intake/tools.py` | 主理人 Agent 工具桥接层。把 `load_corpus` / `chunk_text` / `IndexStore` / `build_profile` / `distill_character` 等函数包装成 LangChain 工具，含 `generate_oc_corpus` / `run_character_interview` 工具（OC 共创） |
 
 ---
 
@@ -306,6 +316,62 @@ python -m persona_distillation.main inspect ./out
 python -m persona_distillation.main chat --workdir ./intake_workdir
 ```
 
+### WebUI 调试面板（推荐用于调试）
+
+```bash
+# 启动 Gradio WebUI：三 Tab 调试面板
+# 默认监听 http://127.0.0.1:7860
+python -m persona_distillation.main webui
+
+# 自定义监听 / 启用公网分享链接
+python -m persona_distillation.main webui --host 0.0.0.0 --port 7860 --share
+```
+
+三个 Tab：
+
+| Tab | 用途 |
+|:---|:---|
+| 🔥 **蒸馏** | 表单填参数（语料/模型/分块/显著度阈值/Skills 数量等）→ 后台跑 `PersonaDistiller.distill` → 实时日志流式刷新 → 完成后展示 DNA 五层产出摘要 |
+| 📂 **产物浏览** | 选 `out/` 子目录 → 加载 `distillation_result.json` → 渲染人格卡 / DNA 五层（含三重验证证据 ✅/❌）/ Skills（点选切换 SKILL.md）/ 预设对话表格 |
+| 💬 **主理人 Agent** | 先点「启动 / 重置 Agent」构建会话级 intake orchestrator；再用自然语言驱动 5 步流程（摄入语料 → 列人物 → 选人物 → 档案 → 蒸馏） |
+| ✨ **OC 共创** | 填 OC 设定（姓名/年龄/背景/性格核心/世界观/口头禅）+ 访谈轮数 → 一键走完三阶段（骨架→访谈→蒸馏）→ 完成后点"👉 立即查看完整产物"自动跳转产物浏览 Tab 加载 |
+
+> WebUI 跨 Gradio 4/5/6 兼容。无需 API key 也能启动——产物浏览 Tab 可离线查看已有产出。
+
+> **全局跨 Tab 联动**：所有蒸馏入口（🔥 蒸馏 Tab / ✨ OC 共创 Tab / 💬 主理人 Agent Tab）
+> 完成后都有 "👉 立即查看完整产物" 按钮，一键跳转产物浏览 Tab 并自动刷新下拉、选中产物目录、
+> 加载人格卡 / DNA 五层 / Skills / 预设对话。三个入口共享同一份 `_jump_to_browse` 联动逻辑。
+
+### OC 共创蒸馏
+
+适用场景：想蒸馏一个**虚构角色（OC, Original Character）**，但手上没有现成语料。
+框架先让 sub-agent 据用户设定的 OC 生成"骨架"文本，再让 character_player sub-agent
+接受主理人访谈产出"血肉"记录，最后合并语料走现有四阶段蒸馏。
+
+三阶段串联（中间产物落 `<workdir>/<persona_id>/`，默认 workdir 为 `./oc_workdir`）：
+
+1. **Phase 1 · 骨架**：4 个 sub-agent 生成独白 / 对话 / 事件 / 回忆 4 类文本 →
+   落盘 `<workdir>/<persona_id>/oc_corpus/{monologue,dialogue,event,memory}.md`
+2. **Phase 2 · 血肉**：character_player sub-agent 读骨架作为人设基础 →
+   主理人 N 轮访谈 → 落盘 `<workdir>/<persona_id>/interview.md`
+3. **Phase 3 · 蒸馏**：骨架目录 + 血肉文件合并作为语料 →
+   调 `PersonaDistiller.distill` 走现有四阶段，产物落 `--output` 目录
+
+```bash
+# 一键走完三阶段：骨架生成 → 血肉访谈 → 蒸馏
+python -m persona_distillation.main cocreate --output ./out
+
+# 非交互式（适用于脚本/CI）
+python -m persona_distillation.main cocreate \
+  --name "星野" --age "17" \
+  --background "高中二年级，天文社社长" \
+  --traits "冷静、好奇、不善社交" \
+  --worldview "宇宙是沉默的，但沉默不等于无意义" \
+  --catchphrase "……让我想想" \
+  --rounds 8 \
+  --output ./out --persona-id hoshino
+```
+
 ### Python API
 
 ```python
@@ -399,7 +465,7 @@ LLM 经常"擅自"把 DNA 五层塞进 `system_prompt` 文本里（典型如 Min
 
 ## 技术栈
 
-`DeepAgents` · `LangChain` · `MiniMax-M3` · `Pydantic` · `tiktoken` · `ChromaDB` · `sentence-transformers`
+`DeepAgents` · `LangChain` · `MiniMax-M3` · `Pydantic` · `tiktoken` · `ChromaDB` · `sentence-transformers` · `Gradio`
 
 ## 致谢
 
