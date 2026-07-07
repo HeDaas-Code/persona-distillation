@@ -1,21 +1,27 @@
-"""主理人 Agent 的工具桥接层。
+"""主理人 Agent 的工具桥接层（Phase 1 重构后版本）。
 
-把 ``persona_distillation`` 包里已有的 Python 函数（``load_corpus`` /
-``chunk_text`` / ``extract_names_from_chunk`` / ``IndexStore`` /
-``build_profile`` / ``distill_character``）包装成 LangChain 工具，
-让主理人 Agent 通过工具调用真实地读取磁盘、写入索引、启动蒸馏。
+设计要点（与旧版的区别）：
+- **NER / 档案 / 蒸馏不再藏在 Python 工具里**——这些 LLM 推理任务由主理人通过
+  ``task`` 分派 SubAgent 完成（intake_ner / profile_builder / extractor / synthesizer /
+  skill_designer / dialogue_writer / bridger），见 ``agents.build_intake_orchestrator``。
+- Python 工具只保留**纯 IO/查询**与**SubAgent 间文件交接**：
+  ``load_text`` / ``load_and_chunk`` / ``index_characters`` / ``list_characters`` /
+  ``search_index`` / ``get_character_entries`` / ``save_distillates`` / ``load_distillates``
+  + OC 共创的 ``generate_oc_corpus`` / ``run_character_interview``。
+- ``IntakeContext`` 一次构造、被所有工具闭包共享（同一个 IndexStore / llm / workdir）。
+- 路径解析三段式：绝对路径 → 相对 CWD → 相对 workdir，命中即用。
+- 工具出错返回人类可读字符串而非抛异常，方便 LLM 兜底。
 
-设计要点：
-- ``IntakeContext`` 一次构造、被所有工具闭包共享（同一个 IndexStore / llm / workdir）
-- 路径解析三段式：绝对路径 → 相对 CWD → 相对 workdir，命中即用
-- 工具出错返回人类可读字符串而非抛异常，方便 LLM 兜底
-- ``intake_corpus`` 把 5 步流程里的"接收文本 + 预处理"合并成一次调用，
-  内部走确定性 Python 编排（``load_corpus → chunk_text → extract_names_from_chunk → store.add``），
-  避免让 LLM 逐块委派子 agent 造成的不稳定
+旧版的 ``intake_corpus``（load+chunk+NER+入库一条龙）、``build_profile``、
+``distill_character`` 三个 Python 黑箱工具已移除——它们的职责分别由
+``load_and_chunk`` + ``task(intake_ner)`` + ``index_characters``、
+``task(profile_builder)``、``task(extractor/synthesizer/skill_designer/dialogue_writer)``
+接管。底层 Python 函数（``bridge.distill_character`` / ``profile_builder.build_profile``）
+仍保留，供 CLI ``distill`` / WebUI 蒸馏 Tab / ``pipeline.PersonaDistiller.distill()`` 直跑。
 """
 from __future__ import annotations
 
-import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,17 +32,15 @@ from langchain_core.tools import BaseTool, tool
 
 from persona_distillation.config import DistillationConfig
 from persona_distillation.loader import load_corpus
-from persona_distillation.chunker import chunk_text
+from persona_distillation.chunker import chunk_text, dedup_chunks
 from persona_distillation.intake.embedder import HashEmbeddings, build_embedder, build_reranker
 from persona_distillation.intake.index_store import IndexStore
-from persona_distillation.intake.name_extractor import extract_names_from_chunk
-from persona_distillation.intake.progress import ProgressReporter
-from persona_distillation.intake.schemas import NameIndexEntry
-from persona_distillation.intake.profile_builder import build_profile as _build_profile
-from persona_distillation.intake.bridge import (
-    distill_character as _distill_character,
-    slugify,
+from persona_distillation.intake.schemas import (
+    NameIndexEntry,
+    NameMention,
+    NerBatchResult,
 )
+from persona_distillation.intake.bridge import slugify
 from persona_distillation.intake.oc_writer import (
     OCSetting,
     generate_oc_corpus as _generate_oc_corpus,
@@ -142,7 +146,7 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
     def load_text(path: str) -> str:
         """加载文件或目录的文本，返回文档清单（不索引、不分块）。
 
-        用于第 1 步「接收文本」——先确认能读到，再决定是否走 intake_corpus。
+        用于第 1 步「接收文本」——先确认能读到，再决定是否走 load_and_chunk。
         支持 .txt/.md/.json/.jsonl/.csv 等多种格式，目录会递归扫描。
         """
         try:
@@ -152,7 +156,7 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
             for d in docs:
                 lines.append(f"  - {d.relpath}  ({d.meta.get('size_chars', 0)} 字符)")
             lines.append(
-                "下一步：调 intake_corpus 让我分块 + 识别人物 + 入库；"
+                "下一步：调 load_and_chunk <path> 让我分块（不做 NER）；"
                 "或调 list_characters 看已索引的人物。"
             )
             return "\n".join(lines)
@@ -160,18 +164,15 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
             return f"加载失败: {e}\n请确认路径正确——可给绝对路径，或相对当前目录 / 工作目录({ctx.workdir})的相对路径。"
 
     @tool
-    def intake_corpus(path: str, max_chunks: int = 0) -> str:
-        """加载 + 分块 + 人物识别 + 入库（Chroma+SQLite）。
+    def load_and_chunk(path: str) -> str:
+        """加载文件或目录 + 分块，返回 chunk 列表 JSON（**不做 NER**）。
 
-        这是 5 步流程里第 1~2 步的合并执行。完成后调 list_characters 看识别到的人物。
+        用于 9 步主流程第 1 步「接收文本 + 分块」。返回的 JSON 数组每个元素含：
+        source / chunk_index / text / char_start / char_end / token_count /
+        corpus_uuid / content_hash / total_chunks。
 
-        支持断点续传：同一文件再次调用会跳过已处理的 chunk（基于 chunk.uuid +
-        content_hash 缓存命中）。若 chunk 内容变化则删除旧索引重处理。
-
-        Args:
-            path: 文件或目录路径（绝对 / 相对 CWD / 相对 workdir 均可）。
-            max_chunks: 本次最多处理多少个**新** chunk（已缓存的自动跳过，不计数）。
-                        0 表示不限制，处理全部。用于长文本分多次摄入。
+        下一步：把返回的 chunk 列表 JSON 交给 `task(intake_ner)` SubAgent 批量做 NER，
+        再把 NerBatchResult JSON 调 index_characters 写入索引库。
         """
         try:
             p = _resolve_path(path, ctx.workdir)
@@ -179,203 +180,276 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
         except Exception as e:  # noqa: BLE001
             return f"加载失败: {e}"
 
-        before = ctx.store.count()
-        total_new_mentions = 0
-        total_skipped = 0
-        total_processed = 0
-        per_file: list[str] = []
-
-        logger.info(
-            "intake_corpus 开始: %d 篇文档, llm=%s, chunk_size=%d, max_chunks=%d",
-            len(docs),
-            type(ctx.llm).__name__ if ctx.llm is not None else "None(启发式)",
-            ctx.cfg.intake_chunk_size,
-            max_chunks,
-        )
-
+        chunks_out: list[dict] = []
+        # Issue #18.a: chunk 去重（NER 之前）。embedder 取自 IndexStore 的嵌入模型；
+        # 离线模式（HashEmbeddings）或 embedder=None 时退化为 SHA-256 精确匹配。
+        embedder_for_dedup = getattr(ctx.store, "_embedding", None)
+        dedup_threshold = ctx.cfg.chunk_dedup_threshold
+        total_dups = 0
         for doc in docs:
-            # 不再传 max_chunks 给 chunk_text——分块始终保持完整，限制只在
-            # 「新 chunk 处理」环节生效（缓存命中的不算），这样断点续传才能
-            # 在二次调用时跳过前 N 块继续处理后续。
             chunks = chunk_text(
                 doc.text,
                 target_tokens=ctx.cfg.intake_chunk_size,
                 overlap_tokens=ctx.cfg.intake_chunk_overlap,
             )
-
-            # 语料 UUID 绑定：LoadedDoc 已基于 content_hash 算好确定性 corpus_uuid，
-            # 同一文件内容（即便路径/编码不同）→ 同一 uuid，是缓存命中的根。
-            corpus_uuid = doc.corpus_uuid
-            content_hash = doc.content_hash
-
-            # 注册语料：首次返回 True 写入 registry，重复返回 False（断点续传场景，
-            # 保留原进度不覆盖）。即使返回 False，后面仍要逐 chunk 检查缓存。
-            is_new = ctx.store.register_corpus(
-                corpus_uuid, doc.relpath, content_hash, len(chunks)
-            )
-            if not is_new:
-                logger.info("语料已注册（断点续传）: %s uuid=%s", doc.relpath, corpus_uuid)
-
-            # 进度指示器：输出到 stderr 不污染 LLM 对话流
-            reporter = ProgressReporter(
-                total=len(chunks),
-                label=doc.relpath,
-                show=ctx.cfg.show_progress,
-            )
-
-            # file_new 是 chunk 计数用于 max_chunks 限制；file_mentions 是
-            # mention 计数用于显示，两者语义不同不要混用。
-            file_new = 0          # 本次新处理的 chunk 数（用于 max_chunks 限制）
-            file_mentions = 0     # 本次新处理的 mention 数（用于显示）
-            file_skipped = 0      # 缓存命中跳过的 chunk 数
-            file_processed = 0    # 已处理总数（含跳过），用于进度条
-
+            before_dedup = len(chunks)
+            chunks = dedup_chunks(chunks, embedder_for_dedup, threshold=dedup_threshold)
+            total_dups += before_dedup - len(chunks)
+            # total_chunks 用原始 chunk 总数（去重不重排 index，便于定位）
+            total = before_dedup
             for chunk in chunks:
-                # 缓存检查：基于 (corpus_uuid, chunk.uuid) 查询。chunk.uuid 是
-                # 确定性 v5（基于块索引 + 块正文 SHA-256[:16]），同一输入恒定。
-                if ctx.cfg.enable_chunk_cache:
-                    cached_hash = ctx.store.is_chunk_processed(
-                        corpus_uuid, chunk.uuid
+                chunks_out.append({
+                    "source": doc.relpath,
+                    "chunk_index": chunk.index,
+                    "text": chunk.text,
+                    "char_start": chunk.char_start,
+                    "char_end": chunk.char_end,
+                    "token_count": chunk.token_count,
+                    "uuid": chunk.uuid,
+                    "corpus_uuid": doc.corpus_uuid,
+                    "content_hash": doc.content_hash,
+                    "total_chunks": total,
+                })
+
+        logger.info(
+            "load_and_chunk: %d 篇文档 / %d 块 (chunk_size=%d, 去重 %d 块)",
+            len(docs), len(chunks_out), ctx.cfg.intake_chunk_size, total_dups,
+        )
+        if not chunks_out:
+            return "未切出任何分块——请确认文件非空且可读。"
+        return json.dumps(chunks_out, ensure_ascii=False)
+
+    @tool
+    def index_characters(ner_results_json: str) -> str:
+        """接收 NerBatchResult JSON，写入 IndexStore（Chroma + SQLite）。
+
+        用于 9 步主流程第 3 步「建索引」。输入是 intake_ner SubAgent 产出的
+        NerBatchResult 序列化 JSON（含 items 列表，每个 item 有 chunk_meta + mentions）。
+        内部调 IndexStore.add() 写入索引条目，保留 corpus_uuid / source / chunk_index /
+        char_start 定位信息。
+
+        完成后调 list_characters 看识别到的人物。
+        """
+        try:
+            data = json.loads(ner_results_json)
+        except json.JSONDecodeError as e:
+            return f"NER 结果 JSON 解析失败: {e}"
+
+        # 兼容 SubAgent 直接返回 NerBatchResult 对象的 dict 形式（{"items": [...]}）
+        # 或裸返回 items 列表（[...]）两种情况
+        if isinstance(data, dict) and "items" in data:
+            items = data.get("items", [])
+        elif isinstance(data, list):
+            items = data
+        else:
+            return "NER 结果应是 NerBatchResult（含 items 列表）或 items 数组"
+
+        before = ctx.store.count()
+        total_mentions = 0
+        per_chunk: list[str] = []
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            chunk_meta = item.get("chunk_meta", {}) or {}
+            mentions_data = item.get("mentions", []) or []
+            source = str(chunk_meta.get("source", "unknown"))
+            try:
+                chunk_index = int(chunk_meta.get("chunk_index", 0))
+            except (TypeError, ValueError):
+                chunk_index = 0
+            try:
+                global_char_start = int(chunk_meta.get("char_start", 0))
+            except (TypeError, ValueError):
+                global_char_start = 0
+            corpus_uuid = str(chunk_meta.get("corpus_uuid", ""))
+
+            # 解析 mentions → NameMention
+            mentions: list[NameMention] = []
+            for m_data in mentions_data:
+                try:
+                    mentions.append(NameMention.model_validate(m_data))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "mention 解析失败 (source=%s chunk=%d): %s",
+                        source, chunk_index, e,
                     )
-                    if cached_hash is not None:
-                        # chunk 现算完整 SHA-256（与 chunk.uuid 里的 [:16] 不同，
-                        # 用完整哈希做内容比对更严格）
-                        chunk_hash = hashlib.sha256(
-                            chunk.text.encode("utf-8")
-                        ).hexdigest()
-                        if cached_hash == chunk_hash:
-                            # 内容没变，跳过（断点续传的核心命中点）
-                            file_skipped += 1
-                            file_processed += 1
-                            reporter.update(file_processed, "")
-                            logger.info(
-                                "跳过已缓存 chunk %d (source=%s)",
-                                chunk.index, doc.relpath,
-                            )
-                            continue
-                        else:
-                            # 内容变了：删旧索引条目后重处理，避免重复写入
-                            logger.warning(
-                                "chunk %d 内容变更 (source=%s)，重新处理",
-                                chunk.index, doc.relpath,
-                            )
-                            ctx.store.delete_chunk_entries(
-                                corpus_uuid, doc.relpath, chunk.index
-                            )
 
-                # max_chunks 限制：只数新处理的 chunk，不数缓存命中的跳过，
-                # 这样长文本分多次摄入时每次都能精确控制成本。
-                if max_chunks > 0 and file_new >= max_chunks:
-                    reporter.update(file_processed, "")
-                    break
-
-                # NER 提取（启发式或 LLM）
-                mentions = extract_names_from_chunk(
-                    chunk,
-                    source=doc.relpath,
-                    llm=ctx.llm,
-                    detect_injection=ctx.cfg.detect_injection,
-                )
-
-                # 写入索引：必须透传 corpus_uuid，否则后续按语料失效缓存会失效
-                chunk_hash = hashlib.sha256(
-                    chunk.text.encode("utf-8")
-                ).hexdigest()
-                chunk_mention_count = 0
-                for m in mentions:
-                    try:
-                        entry = NameIndexEntry.from_mention(
-                            m,
-                            chunk_index=chunk.index,
-                            source=doc.relpath,
-                            global_char_start=chunk.char_start,
-                            corpus_uuid=corpus_uuid,
-                        )
-                        ctx.store.add(entry)
-                        chunk_mention_count += 1
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning(
-                            "索引写入失败 (source=%s chunk=%d): %s",
-                            doc.relpath, chunk.index, e,
-                        )
-
-                # 标记 chunk 已处理（写 processed_chunks 表，便于下次断点续传）
-                if ctx.cfg.enable_chunk_cache:
-                    ctx.store.mark_chunk_processed(
-                        corpus_uuid, chunk.uuid, chunk_hash, chunk_mention_count
+            # 写入索引：复用 intake_corpus 旧版的 from_mention 逻辑
+            chunk_mention_count = 0
+            for m in mentions:
+                try:
+                    entry = NameIndexEntry.from_mention(
+                        m,
+                        chunk_index=chunk_index,
+                        source=source,
+                        global_char_start=global_char_start,
+                        corpus_uuid=corpus_uuid,
+                    )
+                    ctx.store.add(entry)
+                    chunk_mention_count += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "索引写入失败 (source=%s chunk=%d): %s",
+                        source, chunk_index, e,
                     )
 
-                file_new += 1
-                file_processed += 1
-                file_mentions += chunk_mention_count
-                total_new_mentions += chunk_mention_count
-
-                # 进度更新：显示当前 chunk 提取到的人物名（截断到 50 字避免行爆宽）
-                current_names = ", ".join(
-                    sorted({m.name for m in mentions})
-                )[:50]
-                reporter.update(file_processed, current_names)
-
-            # 批次结束：把 processed_chunks 表的实际行数同步回
-            # corpus_registry.processed_chunks 缓存列
-            if ctx.cfg.enable_chunk_cache:
-                ctx.store.update_corpus_progress(corpus_uuid)
-
-            # 进度收尾：打印本文件的最终统计
-            remaining = len(chunks) - file_processed
-            summary_parts = [f"{file_processed}/{len(chunks)} 块", f"新增 {file_mentions} 条提及"]
-            if file_skipped > 0:
-                summary_parts.append(f"跳过 {file_skipped} 块 (缓存命中)")
-            if remaining > 0:
-                summary_parts.append(f"剩余 {remaining} 块未处理")
-            reporter.finish(", ".join(summary_parts))
-
-            total_skipped += file_skipped
-            total_processed += file_processed
-
-            # 单文件汇总行（用于最终输出）
-            file_line = f"  - {doc.relpath}: {file_processed}/{len(chunks)} 块 / 新增 {file_mentions} 条提及"
-            if file_skipped > 0:
-                file_line += f" / 跳过 {file_skipped} 块"
-            if remaining > 0:
-                file_line += f" / 剩余 {remaining} 块（可再次调用继续）"
-            per_file.append(file_line)
+            total_mentions += chunk_mention_count
+            per_chunk.append(f"  - {source}[{chunk_index}]: {chunk_mention_count} 条提及")
 
         added = ctx.store.count() - before
         lines = [
-            f"摄入完成：{len(docs)} 篇文档 / 本次新增 {added} 条索引（{total_new_mentions} 条提及）。",
-            *per_file,
+            f"索引建立完成：{len(items)} 个 chunk / 新增 {added} 条索引（{total_mentions} 条提及）。",
+            *per_chunk,
             f"索引库: {ctx.store.db_dir}",
+            "下一步：调 list_characters 查看识别到的人物。",
         ]
-        if total_skipped > 0:
-            lines.append(f"缓存命中: 跳过 {total_skipped} 块（断点续传生效）")
-        # 检查是否有任何文件还剩未处理 chunk（max_chunks 提前 break 的场景）
-        has_remaining = any("剩余" in pf for pf in per_file)
-        if has_remaining:
-            lines.append(
-                "提示: 部分分块未处理，可再次调用 intake_corpus 同路径继续，"
-                "或直接调 list_characters 基于现有数据开始。"
-            )
-        else:
-            lines.append("下一步：调 list_characters 查看识别到的人物。")
         return "\n".join(lines)
 
     @tool
     def list_characters() -> str:
-        """列出已索引的全部人物 + 各类（speech/appearance/event）计数。"""
+        """列出已索引的全部人物 + 各类（speech/appearance/event）计数 + aliases。
+
+        若 ``cfg.auto_merge=True``，调用前会先做一次跨 chunk 实体归并
+        （见 :func:`~persona_distillation.intake.entity_resolver.resolve_entities`），
+        把同一人物在不同 chunk 里被识别成的多个称谓（如「荒川善次」/「老师」/「荒川」）
+        合并成一条。命中 ≥2 重信号（别名交叉 / 字符串相似 / 嵌入相似）的自动合并；
+        仅命中 1 重的对照会在列表末尾标「待确认」。
+        """
         try:
+            # 自动归并：在 list 之前调一次 resolve_entities
+            merge_summary = ""
+            if ctx.cfg.auto_merge:
+                try:
+                    from persona_distillation.intake.entity_resolver import resolve_entities
+
+                    res = resolve_entities(
+                        ctx.store,
+                        llm=ctx.llm,
+                        auto_merge=True,
+                        threshold=ctx.cfg.auto_merge_threshold,
+                    )
+                    if res.auto_merged or res.pending:
+                        parts = []
+                        if res.auto_merged:
+                            parts.append(
+                                f"自动合并 {len(res.auto_merged)} 对："
+                                + ", ".join(f"{s}→{t}" for s, t in res.auto_merged)
+                            )
+                        if res.pending:
+                            parts.append(f"待确认 {len(res.pending)} 对")
+                        merge_summary = "（归并：" + "；".join(parts) + "）"
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("auto_merge 失败，跳过: %s", e)
+                    merge_summary = f"（auto_merge 跳过: {e}）"
+
             chars = ctx.store.list_characters()
             if not chars:
-                return "索引库里还没有人物。请先调 intake_corpus <文件或目录> 摄入语料。"
-            lines = [f"已识别 {len(chars)} 位人物："]
+                return (
+                    "索引库里还没有人物。请先走 9 步主流程前 3 步：\n"
+                    "  1) load_and_chunk <path> 分块\n"
+                    "  2) task(intake_ner) 批量 NER\n"
+                    "  3) index_characters <ner_results_json> 建索引"
+                )
+            header = f"已识别 {len(chars)} 位人物"
+            if merge_summary:
+                header += merge_summary
+            lines = [header + "："]
             for i, c in enumerate(chars, 1):
                 by_cat = c.get("by_category", {})
                 cat_str = "/".join(f"{k}:{v}" for k, v in sorted(by_cat.items()))
-                lines.append(f"  {i}. {c['character_name']}  (提及 {c['mention_count']} 次 | {cat_str})")
-            lines.append("选择要蒸馏的人物：调 build_profile <名字或编号>。")
+                aliases = c.get("aliases") or []
+                alias_str = f" | 别名: {','.join(aliases)}" if aliases else ""
+                lines.append(
+                    f"  {i}. {c['character_name']}  "
+                    f"(提及 {c['mention_count']} 次 | {cat_str}{alias_str})"
+                )
+            # 「待确认」对照提示：重新跑一次只读 resolve（auto_merge=False）拿 pending 列表
+            if ctx.cfg.auto_merge:
+                try:
+                    from persona_distillation.intake.entity_resolver import resolve_entities
+
+                    res2 = resolve_entities(
+                        ctx.store,
+                        llm=ctx.llm,
+                        auto_merge=False,
+                        threshold=ctx.cfg.auto_merge_threshold,
+                    )
+                    if res2.pending:
+                        lines.append("")
+                        lines.append("以下人物对照仅命中 1 重信号，待确认是否同一人：")
+                        for sig in res2.pending:
+                            tags = []
+                            if sig.alias_hit:
+                                tags.append("别名")
+                            if sig.string_hit:
+                                tags.append("字符串")
+                            if sig.embedding_hit:
+                                tags.append(f"嵌入{sig.embedding_score:.2f}")
+                            lines.append(
+                                f"  - {sig.name_a} ↔ {sig.name_b}  "
+                                f"(命中: {'/'.join(tags) or '无'})"
+                            )
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("pending 复算失败: %s", e)
+            lines.append(
+                "选择要蒸馏的人物：调 get_character_entries <名字或编号> 拿索引条目，"
+                "再 task(profile_builder) 建档案。"
+            )
             return "\n".join(lines)
         except Exception as e:  # noqa: BLE001
             return f"列出人物失败: {e}"
+
+    @tool
+    def resolve_characters() -> str:
+        """跨 chunk 实体归并：把同一人物在不同 chunk 里被识别成的多个称谓合并。
+
+        用于 list_characters 之前的手动归并（若 cfg.auto_merge=False，
+        list_characters 不会自动归并，需主理人显式调本工具）。
+
+        三重信号融合判断是否同一人：
+        a. 别名交叉：A 的 aliases 含 B 的 name（或反之）
+        b. 字符串相似：Levenshtein ≤ 2 或 Jaro-Winkler ≥ cfg.auto_merge_threshold
+        c. 嵌入相似：各人物 top-5 evidence 的 embedding 平均值，cosine ≥ 0.8
+           （无真嵌入时降级，只用 a+b）
+
+        命中 ≥2 重自动合并；命中 1 重标记「待确认」。
+        """
+        try:
+            from persona_distillation.intake.entity_resolver import resolve_entities
+
+            res = resolve_entities(
+                ctx.store,
+                llm=ctx.llm,
+                auto_merge=True,
+                threshold=ctx.cfg.auto_merge_threshold,
+            )
+            lines = [f"实体归并完成（阈值 {ctx.cfg.auto_merge_threshold}）："]
+            if res.auto_merged:
+                lines.append(f"  自动合并 {len(res.auto_merged)} 对：")
+                for source, target in res.auto_merged:
+                    lines.append(f"    - {source} → {target}")
+            else:
+                lines.append("  无自动合并")
+            if res.pending:
+                lines.append(f"  待确认 {len(res.pending)} 对（仅命中 1 重信号）：")
+                for sig in res.pending:
+                    tags = []
+                    if sig.alias_hit:
+                        tags.append("别名")
+                    if sig.string_hit:
+                        tags.append("字符串")
+                    if sig.embedding_hit:
+                        tags.append(f"嵌入{sig.embedding_score:.2f}")
+                    lines.append(
+                        f"    - {sig.name_a} ↔ {sig.name_b}  (命中: {'/'.join(tags)})"
+                    )
+            if res.skipped:
+                lines.append(f"  跳过 {len(res.skipped)} 对（合并失败）")
+            lines.append("下一步：调 list_characters 查看归并后的人物列表。")
+            return "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            return f"实体归并失败: {e}"
 
     @tool
     def search_index(query: str, character_name: str = "") -> str:
@@ -398,10 +472,14 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
             return f"检索失败: {e}"
 
     @tool
-    def build_profile(character_name: str) -> str:
-        """从索引聚合指定人物的档案（speech/appearance/event + 200字摘要）。
+    def get_character_entries(character_name: str) -> str:
+        """获取指定人物的全部索引条目（JSON 数组），供 profile_builder SubAgent 使用。
 
-        用于 5 步流程第 5 步「档案」——完成后让用户确认是否蒸馏。
+        用于 9 步主流程第 5 步——把返回的 JSON + 人物名一起交给 task(profile_builder)
+        SubAgent，由 SubAgent 撰写 CharacterProfile（含 ≤200 字摘要）。
+
+        返回的 JSON 数组每个元素含：category / text / source / chunk_index /
+        char_start / char_end / aliases。
         """
         try:
             chars = ctx.store.list_characters()
@@ -410,68 +488,69 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
             if resolved is None:
                 return f"未找到人物「{character_name}」。已识别: {names or '（空）'}"
 
-            profile = _build_profile(
-                resolved,
-                ctx.store,
-                reranker=ctx.reranker,
-                llm=ctx.llm,
-                top_n=ctx.cfg.rerank_top_n,
-                max_entries=ctx.cfg.profile_max_entries,
-            )
-            lines = [
-                f"人物档案 · {profile.character_name}",
-                f"  别名: {', '.join(profile.aliases) or '(无)'}",
-                f"  提及 {profile.mention_count} 次 | 对话 {profile.speech_count} | 外貌 {profile.appearance_count} | 事件 {profile.event_count}",
-                "",
-                "摘要：",
-                profile.summary,
-                "",
-                f"确认蒸馏此人物？调 distill_character {profile.character_name} 启动。",
-            ]
-            return "\n".join(lines)
+            entries = ctx.store.get_character_entries(resolved)
+            if not entries:
+                return f"人物「{resolved}」暂无索引条目。"
+            items = []
+            for e in entries:
+                items.append({
+                    "category": e.category.value,
+                    "text": e.text,
+                    "source": e.source,
+                    "chunk_index": e.chunk_index,
+                    "char_start": e.char_start,
+                    "char_end": e.char_end,
+                    "aliases": list(e.aliases),
+                })
+            return json.dumps(items, ensure_ascii=False)
         except Exception as e:  # noqa: BLE001
-            return f"档案构建失败: {e}"
+            return f"获取条目失败: {e}"
 
     @tool
-    def distill_character(character_name: str) -> str:
-        """启动指定人物的四阶段蒸馏（extractor → synthesizer → skill_designer → dialogue_writer）。
+    def save_distillates(distillates_json: str) -> str:
+        """把 DistillateList JSON 写到 <workdir>/distillates.json（SubAgent 间文件交接）。
 
-        会把档案重建成临时语料目录喂给 PersonaDistiller，产物落到
-        <workdir>/distilled/<persona_id>/ 下。耗时较长，请耐心等待。
+        用于 9 步主流程第 6 步之后——extractor SubAgent 产出 DistillateList 后，
+        主理人调本工具持久化，避免在 context 里长期保留大体量中间产物。
+        下一个 SubAgent（synthesizer）通过 load_distillates 取回。
         """
+        path = ctx.workdir / "distillates.json"
         try:
-            chars = ctx.store.list_characters()
-            names = [c["character_name"] for c in chars]
-            resolved = _resolve_character_name(character_name, names)
-            if resolved is None:
-                return f"未找到人物「{character_name}」。已识别: {names or '（空）'}"
-
-            profile = _build_profile(
-                resolved,
-                ctx.store,
-                reranker=ctx.reranker,
-                llm=ctx.llm,
-                top_n=ctx.cfg.rerank_top_n,
-                max_entries=ctx.cfg.profile_max_entries,
-            )
-            result = _distill_character(profile, ctx.cfg, ctx.workdir)
-            out_dir = ctx.workdir / "distilled" / result.persona_card.persona_id
-            lines = [
-                f"蒸馏完成 · {result.persona_card.display_name or result.persona_card.persona_id}",
-                f"  人格ID: {result.persona_card.persona_id}",
-                f"  Skills: {len(result.skills)} 个 → {[s.name for s in result.skills]}",
-                f"  预设对话: {len(result.preset_dialogues)} 组",
-                f"  分馏液: {len(result.distillates)} 块",
-                f"  产物目录: {out_dir}",
-                "  - persona_card.json / persona_card.md",
-                "  - preset_dialogues.json",
-                "  - distillates.jsonl",
-                "  - skills/<name>/SKILL.md",
-            ]
-            return "\n".join(lines)
+            path.write_text(distillates_json, encoding="utf-8")
+            # 简单校验：能解析成 JSON 数组或 {distillates: [...]}
+            try:
+                data = json.loads(distillates_json)
+                if isinstance(data, dict) and "distillates" in data:
+                    n = len(data.get("distillates") or [])
+                elif isinstance(data, list):
+                    n = len(data)
+                else:
+                    n = -1
+            except json.JSONDecodeError:
+                n = -1
+            if n < 0:
+                return f"已写入 {path}，但内容不是合法 JSON 数组/DistillateList。"
+            return f"已持久化 {n} 条 Distillate → {path}。下一步：调 load_distillates 取回，再 task(synthesizer)。"
         except Exception as e:  # noqa: BLE001
-            logger.error("蒸馏失败: %s", e, exc_info=True)
-            return f"蒸馏失败: {e}\n（详见日志；可重试或换个人物）"
+            return f"写入 distillates.json 失败: {e}"
+
+    @tool
+    def load_distillates() -> str:
+        """读回 <workdir>/distillates.json 的 JSON 字符串（SubAgent 间文件交接）。
+
+        用于 9 步主流程第 7 步——分派 synthesizer SubAgent 前，主理人调本工具
+        取回 extractor 的 DistillateList，连同 CharacterProfile 一起放进 task prompt。
+        """
+        path = ctx.workdir / "distillates.json"
+        if not path.exists():
+            return (
+                f"文件不存在: {path}。\n"
+                "请先 task(extractor) 产出 DistillateList，再调 save_distillates 持久化。"
+            )
+        try:
+            return path.read_text(encoding="utf-8")
+        except Exception as e:  # noqa: BLE001
+            return f"读取 distillates.json 失败: {e}"
 
     @tool
     def generate_oc_corpus(setting_json: str) -> str:
@@ -481,7 +560,7 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
         name / age / background / traits / worldview / catchphrase 六字段。
 
         4 类文本落到 <workdir>/<persona_id>/oc_corpus/，完成后可调
-        run_character_interview 完善血肉，再调 distill_character 蒸馏。
+        run_character_interview 完善血肉，再走 load_and_chunk + task(extractor) 等蒸馏步骤。
         """
         # 解析 OC 设定 JSON → OCSetting
         try:
@@ -518,7 +597,9 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
             if key in paths:
                 lines.append(f"  - {key}: {word_counts.get(key, 0)} 字 → {paths[key]}")
         lines.append(
-            "下一步：调 run_character_interview 完善血肉，再调 distill_character 蒸馏。"
+            "下一步：调 run_character_interview 完善血肉；然后调 load_and_chunk "
+            f"<{corpus_dir}> 分块，再走 task(extractor) → task(synthesizer) → "
+            "task(skill_designer) → task(dialogue_writer) 蒸馏。"
         )
         return "\n".join(lines)
 
@@ -530,7 +611,7 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
         setting_json 同 generate_oc_corpus（name/age/background/traits/worldview/catchphrase）。
         n_rounds 默认 8。
 
-        访谈记录落 <workdir>/<persona_id>/interview.md，完成后调 distill_character 蒸馏。
+        访谈记录落 <workdir>/<persona_id>/interview.md，完成后走 load_and_chunk + 蒸馏。
         """
         # 解析 OC 设定 JSON → OCSetting
         try:
@@ -570,18 +651,23 @@ def build_intake_tools(ctx: IntakeContext) -> list[BaseTool]:
             f"  轮数: {rounds}",
             f"  访谈记录: {path}",
             f"  蒸馏目录: {distill_dir}",
-            "下一步：调 distill_character 启动蒸馏"
-            f"（蒸馏输入目录 {distill_dir}/，loader 会递归读取 oc_corpus/ + interview.md）。",
+            "下一步：调 load_and_chunk "
+            f"<{distill_dir}> 分块（loader 会递归读取 oc_corpus/ + interview.md），"
+            "再走 task(extractor) → task(synthesizer) → task(skill_designer) → "
+            "task(dialogue_writer) 蒸馏。",
         ]
         return "\n".join(lines)
 
     return [
         load_text,
-        intake_corpus,
+        load_and_chunk,
+        index_characters,
+        resolve_characters,
         list_characters,
         search_index,
-        build_profile,
-        distill_character,
+        get_character_entries,
+        save_distillates,
+        load_distillates,
         generate_oc_corpus,
         run_character_interview,
     ]

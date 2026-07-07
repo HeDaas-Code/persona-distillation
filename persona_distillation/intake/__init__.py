@@ -49,6 +49,11 @@ from persona_distillation.intake.tools import (
     build_intake_context,
     build_intake_tools,
 )
+from persona_distillation.intake.entity_resolver import (
+    CharacterSignals,
+    ResolveResult,
+    resolve_entities,
+)
 
 __all__ = [
     "IndexCategory",
@@ -69,4 +74,8 @@ __all__ = [
     "IntakeContext",
     "build_intake_context",
     "build_intake_tools",
+    # 跨 chunk 实体归并
+    "CharacterSignals",
+    "ResolveResult",
+    "resolve_entities",
 ]

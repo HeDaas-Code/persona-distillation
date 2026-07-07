@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -269,7 +270,28 @@ class DistillationResult(BaseModel):
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
-        render_persona_card(self, out)
+        # renderer 用标准库 json.dumps 序列化 metadata，不支持 Pydantic 对象；
+        # 若 metadata 含 EvalReport，渲染时传一份 model_dump() 后的纯 dict 副本，
+        # 避免触发 "Object of type EvalReport is not JSON serializable"。
+        eval_report = self.metadata.get("eval_report")
+        has_eval_report = isinstance(eval_report, EvalReport)
+        if has_eval_report:
+            safe_result = self.model_copy(
+                update={
+                    "metadata": {
+                        k: (
+                            v.model_dump()
+                            if isinstance(v, EvalReport)
+                            else v
+                        )
+                        for k, v in self.metadata.items()
+                    }
+                }
+            )
+            render_persona_card(safe_result, out)
+        else:
+            render_persona_card(self, out)
+
         write_skills(self.persona_card.persona_id, self.skills, out)
 
         (out / "preset_dialogues.json").write_text(
@@ -284,6 +306,13 @@ class DistillationResult(BaseModel):
             self.model_dump_json(indent=2, exclude={"distillates"}),
             encoding="utf-8",
         )
+        # 若 metadata 含 EvalReport 对象，额外落盘 eval_report.json
+        # （EvalReport 与本类同文件定义，无需额外 import）
+        if has_eval_report:
+            (out / "eval_report.json").write_text(
+                eval_report.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
         logger.info("distillation_result saved to %s", out)
         return out
 
@@ -309,3 +338,154 @@ class DistillationResult(BaseModel):
         except ValidationError:
             # 兼容只存了 persona_card 的情况
             return cls.model_validate({"persona_card": data, "schema_version": SCHEMA_VERSION})
+
+
+# ---------------------------------------------------------------------------
+# 蒸馏质量评估数据契约（eval/ 子包产出）
+# ---------------------------------------------------------------------------
+class CoverageScore(BaseModel):
+    """覆盖度评估结果（纯规则统计，无需 LLM）。"""
+
+    total_score: float = Field(ge=0.0, le=1.0, description="加权汇总分 ∈ [0,1]")
+    details: dict[str, Any] = Field(
+        default_factory=dict, description="各分项原始数值，人类可读"
+    )
+    expression_dna_richness: float = Field(
+        ge=0.0, le=1.0, description="表达DNA丰富度"
+    )
+    mental_model_count: int = Field(
+        ge=0, description="心智模型总数（含未通过验证的）"
+    )
+    mental_model_verification_pass_rate: float = Field(
+        ge=0.0, le=1.0, description="三重验证通过率"
+    )
+    anti_pattern_count: int = Field(ge=0)
+    honest_boundary_count: int = Field(ge=0)
+    decision_heuristic_count: int = Field(ge=0)
+
+
+class FidelityScore(BaseModel):
+    """忠实度评估结果（LLM-as-judge）。score=-1 表示 judge 调用失败。"""
+
+    score: float = Field(
+        ge=-1.0, le=1.0, description="忠实度分数 ∈ [0,1]，-1 表示失败"
+    )
+    reasons: list[str] = Field(
+        default_factory=list, description="judge 给出的理由（通常 3 条）"
+    )
+
+
+class IdentifiabilityScore(BaseModel):
+    """可识别度评估结果（LLM-as-judge 盲猜人物）。confidence=-1 表示失败。"""
+
+    probes: list[str] = Field(
+        default_factory=list, description="probe Q&A 文本列表"
+    )
+    guessed_name: str = Field(default="", description="judge 猜的人物名")
+    confidence: float = Field(
+        ge=-1.0, le=1.0, description="judge 置信度 ∈ [0,1]，-1 表示失败"
+    )
+    correct: bool = Field(default=False, description="盲猜是否正确（模糊匹配）")
+    error: str = Field(default="", description="失败时的错误信息")
+
+
+class EvalReport(BaseModel):
+    """蒸馏质量评估报告。"""
+
+    coverage: CoverageScore
+    fidelity: FidelityScore | None = None
+    identifiability: IdentifiabilityScore | None = None
+    overall_score: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="加权汇总（coverage 0.3 + fidelity 0.4 + identifiability 0.3）",
+    )
+    created_at: str = Field(
+        default_factory=lambda: datetime.now().isoformat(),
+        description="评估时间",
+    )
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "EvalReport":
+        """从 ``eval_report.json`` 反序列化。
+
+        ``path`` 既可以是含 ``eval_report.json`` 的目录，也可以是该文件本身。
+        损坏或结构不匹配时抛清晰错误，便于上游 CLI 友好提示。
+        """
+        p = Path(path)
+        if p.is_dir():
+            p = p / "eval_report.json"
+        if not p.exists():
+            raise FileNotFoundError(f"评估报告不存在: {p}")
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"评估报告 JSON 损坏: {p}: {e}") from e
+        try:
+            return cls.model_validate(data)
+        except ValidationError as e:
+            raise ValueError(
+                f"评估报告结构与 EvalReport 不匹配: {p}: {e}"
+            ) from e
+
+    def to_markdown(self) -> str:
+        """人类可读 Markdown 摘要，含总评分与所有非 None 分项。"""
+        lines: list[str] = [
+            "# 蒸馏质量评估报告",
+            "",
+            f"- **总评分**: {self.overall_score:.3f}",
+            f"- **评估时间**: {self.created_at}",
+            "",
+        ]
+
+        # 覆盖度（必有）
+        c = self.coverage
+        lines.append("## 覆盖度 (Coverage)")
+        lines.append(f"- 总分: {c.total_score:.3f}")
+        lines.append(f"- 表达DNA丰富度: {c.expression_dna_richness:.3f}")
+        lines.append(
+            f"- 心智模型数: {c.mental_model_count}"
+            f"（通过率 {c.mental_model_verification_pass_rate:.2%}）"
+        )
+        lines.append(f"- 反模式数: {c.anti_pattern_count}")
+        lines.append(f"- 诚实边界数: {c.honest_boundary_count}")
+        lines.append(f"- 决策启发式数: {c.decision_heuristic_count}")
+        if c.details:
+            lines.append("- 明细:")
+            for k, v in c.details.items():
+                lines.append(f"  - {k}: {v}")
+        lines.append("")
+
+        # 忠实度（可选）
+        if self.fidelity is not None:
+            f = self.fidelity
+            lines.append("## 忠实度 (Fidelity)")
+            if f.score < 0:
+                lines.append(f"- 评估失败（score={f.score}）")
+            else:
+                lines.append(f"- 分数: {f.score:.3f}")
+            if f.reasons:
+                lines.append("- 理由:")
+                for r in f.reasons:
+                    lines.append(f"  - {r}")
+            lines.append("")
+
+        # 可识别度（可选）
+        if self.identifiability is not None:
+            i = self.identifiability
+            lines.append("## 可识别度 (Identifiability)")
+            if i.confidence < 0:
+                lines.append(f"- 评估失败（confidence={i.confidence}）")
+                if i.error:
+                    lines.append(f"- 错误: {i.error}")
+            else:
+                lines.append(f"- 猜测人物: {i.guessed_name or '(空)'}")
+                lines.append(f"- 置信度: {i.confidence:.3f}")
+                lines.append(f"- 盲猜正确: {'是' if i.correct else '否'}")
+            if i.probes:
+                lines.append("- Probe Q&A:")
+                for idx, q in enumerate(i.probes, 1):
+                    lines.append(f"  {idx}. {q}")
+            lines.append("")
+
+        return "\n".join(lines)

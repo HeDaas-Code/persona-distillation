@@ -35,7 +35,7 @@ from persona_distillation.schemas import (
 )
 from persona_distillation.pipeline import PersonaDistiller
 from persona_distillation.loader import LoadedDoc, load_corpus
-from persona_distillation.chunker import Chunk, chunk_text
+from persona_distillation.chunker import Chunk, chunk_text, dedup_chunks
 from persona_distillation.triple_verification import verify_mental_models
 # intake 子包
 from persona_distillation.intake import (
@@ -66,6 +66,7 @@ __all__ = [
     "load_corpus",
     "Chunk",
     "chunk_text",
+    "dedup_chunks",
     # DNA 级别
     "ExpressionDNA",
     "MentalModel",

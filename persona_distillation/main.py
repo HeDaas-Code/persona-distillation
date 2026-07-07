@@ -171,15 +171,17 @@ def _cmd_webui(args: argparse.Namespace) -> int:
 # cocreate 子命令：OC 共创三阶段（骨架 → 血肉访谈 → 蒸馏）
 # ---------------------------------------------------------------------------
 def _slugify_persona_id(name: str) -> str:
-    """从 name 生成 ASCII-only persona_id；无法生成时返回空串。
+    """从 name 生成 persona_id（支持中文字符）；无法生成时返回空串。
 
-    规则：小写化 → 空白转下划线 → 去除非 [a-z0-9_] 字符 → 去首尾下划线。
-    若 name 含非 ASCII 字符（如中文/日文），slugify 后会为空，调用方应提示
+    规则：小写化 → 空白转下划线 → 保留中文/小写字母/数字/下划线，去除其余字符
+    （空格/标点删除）→ 去首尾下划线。
+    中文 name slugify 后保留中文字符（persona_id 用作目录名，Linux/macOS 支持中文目录）。
+    若 name 仅含无法保留的字符（如纯标点），slugify 后为空，调用方应提示
     用户用 ``--persona-id`` 显式指定。
     """
     n = name.strip().lower()
     n = re.sub(r"\s+", "_", n)
-    n = re.sub(r"[^a-z0-9_]+", "", n)
+    n = re.sub(r"[^\u4e00-\u9fa5a-z0-9_]+", "", n)
     n = n.strip("_")
     return n
 
@@ -222,9 +224,9 @@ def _prompt_oc_setting(args: argparse.Namespace):
 
         persona_id = _slugify_persona_id(name)
         if not persona_id:
-            print(f"无法从姓名 '{name}' 自动生成 ASCII persona_id。")
+            print(f"无法从姓名 '{name}' 自动生成 persona_id。")
             persona_id = input(
-                "请手动输入 persona_id（小写字母/数字/连字符，回车取消）: "
+                "请手动输入 persona_id（小写字母/数字/中文，回车取消）: "
             ).strip()
             if not persona_id:
                 print("未提供 persona_id，已取消。")
@@ -271,7 +273,7 @@ def _cmd_cocreate(args: argparse.Namespace) -> int:
         persona_id = args.persona_id or _slugify_persona_id(args.name)
         if not persona_id:
             logger.error(
-                "无法从姓名 %r 自动生成 ASCII persona_id（含非 ASCII 字符），"
+                "无法从姓名 %r 自动生成 persona_id，"
                 "请用 --persona-id 显式指定。",
                 args.name,
             )
@@ -334,6 +336,55 @@ def _cmd_cocreate(args: argparse.Namespace) -> int:
         logger.error("[Phase 3 蒸馏] 失败: %s", e, exc_info=True)
         return 1
     _print_summary(result, Path(args.output))
+    return 0
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    """对已落盘的蒸馏产物跑质量评估，落盘 eval_report.json 并打印摘要。"""
+    from persona_distillation.agents import build_model
+    from persona_distillation.eval.report import build_report
+
+    # 1. 加载蒸馏产物：output_dir 既可能是目录，也可能是 distillation_result.json 本身
+    p = Path(args.output_dir)
+    result_path = p / "distillation_result.json" if p.is_dir() else p
+    if not result_path.exists():
+        logger.error("找不到蒸馏产物文件: %s", result_path)
+        return 1
+    try:
+        result = DistillationResult.load(result_path)
+    except Exception as e:
+        logger.error("加载蒸馏产物失败: %s", e, exc_info=True)
+        return 1
+
+    card = result.persona_card
+    skills = result.skills
+    distillates = result.distillates
+    out_dir = result_path.parent
+
+    # 2. 构造 LLM（--offline 时跳过）；失败则优雅降级到 offline（仅跑覆盖度）
+    llm = None
+    if not args.offline:
+        try:
+            if args.model:
+                cfg = DistillationConfig(model=args.model, debug=args.debug)
+            else:
+                cfg = DistillationConfig(debug=args.debug)
+            llm = build_model(cfg)
+        except Exception as e:
+            logger.warning(
+                "构造 LLM 失败 (%s)，降级为 offline 模式（仅跑覆盖度评估）", e
+            )
+            llm = None
+
+    # 3. 跑评估并落盘 eval_report.json
+    report = build_report(card, skills, distillates, llm=llm)
+    report_path = out_dir / "eval_report.json"
+    report_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    logger.info("评估报告已落盘: %s", report_path)
+
+    # 4. 终端打印人类可读摘要
+    print(report.to_markdown())
+    print(f"\n（评估报告已写入 {report_path}）")
     return 0
 
 
@@ -415,6 +466,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="中间产物（oc_corpus/ + interview.md）目录（默认 ./oc_workdir）")
     cc.add_argument("--debug", action="store_true")
     cc.set_defaults(func=_cmd_cocreate)
+
+    p_eval = sub.add_parser(
+        "eval", help="对已落盘的蒸馏产物跑质量评估"
+    )
+    p_eval.add_argument(
+        "output_dir",
+        help="蒸馏产物目录（含 distillation_result.json）",
+    )
+    p_eval.add_argument(
+        "--offline", action="store_true",
+        help="只跑覆盖度评估，不调 LLM",
+    )
+    p_eval.add_argument(
+        "--model", default=None,
+        help="覆盖配置里的模型（如 minimax:MiniMax-M3）",
+    )
+    p_eval.add_argument("--debug", action="store_true")
+    p_eval.set_defaults(func=_cmd_eval)
     return parser
 
 

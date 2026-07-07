@@ -107,6 +107,11 @@ class DistillationConfig:
     # intake 阶段分块目标 token 数（比蒸馏阶段小，保证 NER 粒度）
     intake_chunk_size: int = 1200
     intake_chunk_overlap: int = 120
+    # Issue #16: NER 并行度。NER 是 HTTP I/O bound，用 ThreadPoolExecutor 并行
+    # 调 LLM 可显著加速。Phase 1 重构后 NER 主路径走 SubAgent 批量 prompt
+    # （intake_ner 一次性接收全部 chunk），本字段供 Python 直跑 / 兜底并行路径使用。
+    # 写库（IndexStore.add_many）始终串行，避免 SQLite locked / Chroma 损坏。
+    ner_parallel: int = 4
     # 离线模式：跳过真实模型下载，用伪 embedding + 关键词检索
     offline: bool = field(
         default_factory=lambda: os.environ.get("OFFLINE", "0") in ("1", "true", "True")
@@ -119,11 +124,23 @@ class DistillationConfig:
     # 是否启用 chunk 级缓存（断点续传，跳过已处理 chunk）
     enable_chunk_cache: bool = True
     """是否启用 chunk 级缓存（断点续传，跳过已处理 chunk）。"""
+    # 跨 chunk 实体归并：是否在 list_characters 之前自动合并同一人物
+    # （三重信号：别名交叉 + 字符串相似 + 嵌入相似；命中 ≥2 重自动合并）
+    auto_merge: bool = True
+    """跨 chunk 实体归并：是否自动合并同一人物（命中 ≥2 重信号时）。"""
+    auto_merge_threshold: float = 0.85
+    """自动合并的字符串相似度阈值（Jaro-Winkler 下限，Levenshtein 仍按 ≤2）。"""
+    # Issue #18.a: chunk 去重阈值（cosine ≥ 该值视为重复，跳过）
+    # HashEmbeddings 时退化为 SHA-256 精确匹配，本字段被忽略
+    chunk_dedup_threshold: float = 0.95
+    """chunk 去重阈值：cosine ≥ 该值视为重复；HashEmbeddings 时退化为 SHA-256 精确匹配。"""
 
     def __post_init__(self) -> None:
         """P0-2: 启动时校验 API key，避免跑到一半才报缺 key。"""
-        if self.dry_run:
-            logger.debug("dry_run=True，跳过 API key 校验")
+        if self.offline or self.dry_run:
+            logger.debug(
+                "offline=%s dry_run=%s，跳过 API key 校验", self.offline, self.dry_run,
+            )
             return
         if self.model.startswith("minimax:"):
             key = os.environ.get(self.minimax_api_key_env, "")

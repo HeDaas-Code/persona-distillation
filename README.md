@@ -28,6 +28,8 @@
 >   4 个 sub-agent 据用户设定的 OC 生成"骨架"文本（独白/对话/事件/回忆）→
 >   character_player sub-agent 接受主理人 N 轮访谈产出"血肉"记录 →
 >   合并语料走现有四阶段蒸馏。适用于想蒸馏一个虚构角色（OC）但手上没有现成语料的场景。
+> - **质量评估模式**（量化还原度）—— `eval` 子命令对已落盘产物跑三维度评估
+>   （覆盖度 / 忠实度 / 可识别度），产出 `eval_report.json`；`--offline` 时只跑覆盖度，不调 LLM。
 >
 > **灵感**：Skills 生成逻辑参考 [nuwa-skill](https://github.com/alchaincyf/nuwa-skill) 的认知操作系统方法论——
 > 捕捉的是 _HOW they think_，不是 _WHAT they said_。
@@ -201,6 +203,10 @@
 | **intake / oc_writer** | `intake/oc_writer.py` | OC 共创 Phase 1：4 类骨架文本生成（独白/对话/事件/回忆） |
 | **intake / interview** | `intake/interview.py` | OC 共创 Phase 2：character_player 读骨架 + 主理人 N 轮访谈 |
 | **intake / tools** | `intake/tools.py` | 主理人 Agent 工具桥接层。把 `load_corpus` / `chunk_text` / `IndexStore` / `build_profile` / `distill_character` 等函数包装成 LangChain 工具，含 `generate_oc_corpus` / `run_character_interview` 工具（OC 共创） |
+| **eval / coverage** | `eval/coverage.py` | **纯规则覆盖度评估器**。统计 DNA 五层字段数 / 三重验证通过率 / 反模式数 / 诚实边界数。无需 LLM，返回 `CoverageScore(total_score, details)` |
+| **eval / fidelity** | `eval/fidelity.py` | **LLM-as-judge 忠实度评估器**。让独立模型对比 PersonaCard 与原语料打分 0~1 + 3 条理由；judge 调用失败记 -1，不阻塞其它评估 |
+| **eval / identifiability** | `eval/identifiability.py` | **LLM-as-judge 可识别度评估器**（盲猜）。用 PersonaCard 跑 probe 问题，让独立 judge 盲猜人物，返回 `guessed_name` / `confidence` / `correct` |
+| **eval / report** | `eval/report.py` | **评估报告汇总器**。合并三个评估器结果成 `EvalReport`（coverage 0.3 + fidelity 0.4 + identifiability 0.3 加权）；`llm=None` 时只跑覆盖度 |
 
 ---
 
@@ -332,7 +338,7 @@ python -m persona_distillation.main webui --host 0.0.0.0 --port 7860 --share
 | Tab | 用途 |
 |:---|:---|
 | 🔥 **蒸馏** | 表单填参数（语料/模型/分块/显著度阈值/Skills 数量等）→ 后台跑 `PersonaDistiller.distill` → 实时日志流式刷新 → 完成后展示 DNA 五层产出摘要 |
-| 📂 **产物浏览** | 选 `out/` 子目录 → 加载 `distillation_result.json` → 渲染人格卡 / DNA 五层（含三重验证证据 ✅/❌）/ Skills（点选切换 SKILL.md）/ 预设对话表格 |
+| 📂 **产物浏览** | 选 `out/` 子目录 → 加载 `distillation_result.json` → 渲染人格卡 / DNA 五层（含三重验证证据 ✅/❌）/ Skills（点选切换 SKILL.md）/ 预设对话表格 / 📊 评估区（overall_score 进度条 + 三项分项 + 🔄 重新评估按钮） |
 | 💬 **主理人 Agent** | 先点「启动 / 重置 Agent」构建会话级 intake orchestrator；再用自然语言驱动 5 步流程（摄入语料 → 列人物 → 选人物 → 档案 → 蒸馏） |
 | ✨ **OC 共创** | 填 OC 设定（姓名/年龄/背景/性格核心/世界观/口头禅）+ 访谈轮数 → 一键走完三阶段（骨架→访谈→蒸馏）→ 完成后点"👉 立即查看完整产物"自动跳转产物浏览 Tab 加载 |
 
@@ -372,6 +378,35 @@ python -m persona_distillation.main cocreate \
   --output ./out --persona-id hoshino
 ```
 
+### 质量评估
+
+对已落盘的蒸馏产物跑三维度评估，量化人格还原度，产出 `eval_report.json`。
+
+```bash
+# 对已落盘的蒸馏产物跑评估（含 LLM judge）
+python -m persona_distillation.main eval ./out/hoshino
+
+# 仅离线评估（只跑覆盖度，不调 LLM）
+python -m persona_distillation.main eval ./out/hoshino --offline
+```
+
+三个评估维度：
+
+| 维度 | 评估器 | 方式 | 说明 |
+|:---|:---|:---|:---|
+| **覆盖度** | `eval/coverage` | 纯规则 | DNA 五层字段数 / 三重验证通过率 / 反模式数。无需 LLM |
+| **忠实度** | `eval/fidelity` | LLM-as-judge | 独立模型对比 PersonaCard 与原语料，打分 0~1 + 3 条理由 |
+| **可识别度** | `eval/identifiability` | LLM-as-judge | 用 PersonaCard 跑 probe 问题，让独立 judge 盲猜人物 |
+
+评估完成后在产物目录落盘 `eval_report.json`（含三项分项 + 加权 `overall_score` + 人类可读 Markdown 摘要）。
+`--offline` 时只跑覆盖度；judge 调用失败优雅降级（该项记 -1，不阻塞其它评估）。
+
+> 蒸馏时同步评估：CLI `distill` 子命令不带评估开关，请在 Python API 传 `eval=True`，
+> 或蒸馏完成后用 `eval` 子命令对产物补跑评估。
+> ```python
+> result = distiller.distill("./corpus", output_dir="./out", eval=True)
+> ```
+
 ### Python API
 
 ```python
@@ -383,13 +418,13 @@ distiller = PersonaDistiller(DistillationConfig(
 result = distiller.distill("examples/sample_corpus", output_dir="./out")
 ```
 
-### 自主编排模式（交互式，蒸馏侧）
+### 主理人 Agent（交互式，蒸馏侧）
 
 ```python
-from persona_distillation.agents import build_orchestrator
+from persona_distillation.agents import build_intake_orchestrator
 from persona_distillation.config import DistillationConfig
 
-agent = build_orchestrator(DistillationConfig(model="minimax:MiniMax-M3"))
+agent = build_intake_orchestrator(DistillationConfig(model="minimax:MiniMax-M3"))
 agent.invoke({"messages": [{"role": "user", "content": "蒸馏 ./corpus 到 ./out"}]})
 ```
 

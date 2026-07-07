@@ -40,12 +40,47 @@ class NameMention(BaseModel):
     evidence: str = Field(..., description="原文引文，≤120 字")
     char_start: int = Field(0, description="在所属分块内的相对起止")
     char_end: int = Field(0, description="在所属分块内的相对起止")
+    # 同一 evidence 中同时出现的人物名（关系提取用）
+    co_mentioned: list[str] = Field(
+        default_factory=list,
+        description="同一 evidence 中同时出现的人物名（关系提取用）",
+    )
+    # 与主人物的关系（如「学生」「上级」「对手」「亲人」）
+    relation_to: str | None = Field(
+        None, description="与主人物的关系（如「学生」「上级」「对手」「亲人」）"
+    )
 
 
 class NameExtractionResult(BaseModel):
     """LLM-NER 对单分块的产出。"""
 
     mentions: list[NameMention] = Field(default_factory=list)
+
+
+class NerBatchItem(BaseModel):
+    """intake_ner SubAgent 单个 chunk 的批量产出。
+
+    在 ``NameExtractionResult`` 基础上多带一份 ``chunk_meta``——``index_characters``
+    Python 工具依赖这份元信息（source / chunk_index / char_start / corpus_uuid /
+    content_hash）才能把 mention 重建为带定位的 :class:`NameIndexEntry`。
+    SubAgent 必须原样透传 chunk_meta，不要改写。
+    """
+
+    chunk_meta: dict[str, Any] = Field(
+        default_factory=dict,
+        description="chunk 元信息，原样透传：source / chunk_index / char_start / "
+                    "corpus_uuid / content_hash / total_chunks",
+    )
+    mentions: list[NameMention] = Field(default_factory=list)
+
+
+class NerBatchResult(BaseModel):
+    """intake_ner SubAgent 批量产出的包装（response_format 用）。
+
+    一次性接收全部 chunk，对每个 chunk 输出一个 :class:`NerBatchItem`。
+    """
+
+    items: list[NerBatchItem] = Field(default_factory=list)
 
 
 class NameIndexEntry(BaseModel):
@@ -68,6 +103,12 @@ class NameIndexEntry(BaseModel):
     char_end: int = 0
     chunk_index: int = 0
     embedding: list[float] | None = None
+    # 与主人物的关系（关系提取 + 条件脱名用）
+    relation_to: str | None = Field(None, description="与主人物的关系")
+    # 同一 evidence 中同时出现的人物名（关系提取 + 条件脱名用）
+    co_mentioned: list[str] = Field(
+        default_factory=list, description="同一 evidence 中同时出现的人物名"
+    )
 
     @classmethod
     def from_mention(
@@ -83,6 +124,9 @@ class NameIndexEntry(BaseModel):
 
         ``corpus_uuid`` 由调用方从 ``LoadedDoc.corpus_uuid`` 透传，
         不传则留空（向后兼容旧调用点）。
+
+        ``relation_to`` / ``co_mentioned`` 从 :class:`NameMention` 透传，
+        供 ``rebuild_corpus_dir`` 条件脱名时生成角色标签。
         """
         return cls(
             character_name=m.name,
@@ -94,6 +138,8 @@ class NameIndexEntry(BaseModel):
             chunk_index=chunk_index,
             char_start=global_char_start + m.char_start,
             char_end=global_char_start + m.char_end,
+            relation_to=m.relation_to,
+            co_mentioned=list(m.co_mentioned),
         )
 
     def to_metadata(self) -> dict[str, Any]:
@@ -109,6 +155,8 @@ class NameIndexEntry(BaseModel):
             "char_end": self.char_end,
             "text": self.text,
             "aliases": ",".join(self.aliases),
+            "relation_to": self.relation_to or "",
+            "co_mentioned": ",".join(self.co_mentioned),
         }
 
 

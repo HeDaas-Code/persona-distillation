@@ -26,13 +26,39 @@ from persona_distillation.schemas import (
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
 
-def _sanitize(name: str, fallback: str) -> str:
+def _ensure_unique(name: str, existing: list[str] | set[str] | None) -> str:
+    """若 ``name`` 已在 ``existing`` 中，追加 ``-2``、``-3``… 直到唯一。
+
+    用于避免多个非法 skill 名 sanitize 成相同 fallback 后产生目录冲突。
+    """
+    if not existing:
+        return name
+    seen_set = set(existing)
+    if name not in seen_set:
+        return name
+    i = 2
+    while f"{name}-{i}" in seen_set:
+        i += 1
+    return f"{name}-{i}"
+
+
+def _sanitize_skill_name(
+    name: str,
+    fallback: str = "skill",
+    existing: list[str] | set[str] | None = None,
+) -> str:
+    """清洗 skill 名并去重。
+
+    - 小写、仅保留 ``a-z0-9-``、合并多余连字符
+    - 不合法（空或不符合 ``_NAME_RE``）则用 ``fallback``
+    - 若结果在 ``existing`` 中已存在，追加 ``-2``、``-3``… 直到唯一
+    """
     n = name.strip().lower()
     n = re.sub(r"[^a-z0-9-]+", "-", n)
     n = re.sub(r"-+", "-", n).strip("-")
     if not n or not _NAME_RE.match(n):
         n = fallback
-    return n
+    return _ensure_unique(n, existing)
 
 
 def write_skills(
@@ -44,17 +70,18 @@ def write_skills(
     out = Path(out_dir) / "skills"
     out.mkdir(parents=True, exist_ok=True)
 
-    pid = _sanitize(persona_id, "persona")
+    pid = _sanitize_skill_name(persona_id, "persona")
     written: list[Path] = []
-    seen: set[str] = set()
+    seen_names: set[str] = set()
 
     for i, sk in enumerate(skills):
-        name = _sanitize(sk.name, f"{pid}-skill-{i}")
+        # 先清洗（不加前缀），再用 pid 前缀补齐，最后对 seen_names 去重
+        name = _sanitize_skill_name(sk.name, f"{pid}-skill-{i}")
         if not name.startswith(pid):
             name = f"{pid}-{name}"[:64]
-        if name in seen:
-            name = f"{name}-{i}"
-        seen.add(name)
+        # 加前缀后可能再次冲突，统一在这里确保唯一
+        name = _ensure_unique(name, seen_names)
+        seen_names.add(name)
 
         skill_dir = out / name
         skill_dir.mkdir(exist_ok=True)

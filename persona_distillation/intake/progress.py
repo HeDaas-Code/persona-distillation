@@ -5,12 +5,18 @@
 from __future__ import annotations
 
 import sys
+import threading
 
 
 class ProgressReporter:
     """实时进度指示器，输出到 stderr。
 
     用 ``\\r`` 原地更新，不换行，避免污染 LLM 对话流。
+
+    Issue #16: NER 改并行后，多个 worker 线程可能同时调 ``update`` 报告自己
+    那条 chunk 的进度。用 ``threading.Lock`` 保护 stderr 写入，避免进度行
+    字符交错撕裂。锁是进程内有效的——跨进程不保护（本进程内 NER 用
+    ThreadPoolExecutor，足够）。
 
     Example::
 
@@ -26,6 +32,8 @@ class ProgressReporter:
         self.label = label
         self.show = show
         self._started = False
+        # Issue #16: 并发安全锁——多线程 update/finish 不会撕裂 stderr 输出
+        self._lock = threading.Lock()
 
     def update(self, done: int, current_names: str = "") -> None:
         """更新进度条。
@@ -51,16 +59,19 @@ class ProgressReporter:
             line = line.ljust(80)
         if len(line) > 80:
             line = line[:77] + "..."
-        sys.stderr.write(line)
-        sys.stderr.flush()
-        self._started = True
+        # 加锁：多线程并发 update 时避免 stderr 写入交错
+        with self._lock:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+            self._started = True
 
     def finish(self, summary: str) -> None:
         """完成时打印最终统计（换行后打印 summary）。"""
         if not self.show:
             return
-        if self._started:
-            sys.stderr.write("\n")
+        with self._lock:
+            if self._started:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+            sys.stderr.write(f"✓ {self.label} 完成: {summary}\n")
             sys.stderr.flush()
-        sys.stderr.write(f"✓ {self.label} 完成: {summary}\n")
-        sys.stderr.flush()

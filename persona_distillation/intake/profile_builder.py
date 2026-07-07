@@ -20,6 +20,74 @@ from persona_distillation.intake.schemas import (
 )
 
 
+def _multi_query_rerank(
+    entries: list[NameIndexEntry],
+    queries: list[str],
+    top_n: int,
+    reranker: Any = None,
+) -> list[NameIndexEntry]:
+    """多 query 重排：每个 query 各取 ``top_n // len(queries)``，合并去重。
+
+    Issue #18.e：用 3 个不同视角的 query 做重排，避免单一 query 偏置导致漏选。
+    合并后若条目数不足 ``top_n``，用原 query 兜底补足；若仍超出则按首次出现
+    顺序截断到 ``top_n``。
+
+    Args:
+        entries: 待选条目。
+        queries: 多视角 query 列表（如人名 / 说话风格 / 外貌特征）。
+        top_n: 最终保留条目数。
+        reranker: cross-encoder reranker；``None`` 时退化为按顺序取前 ``top_n``。
+    """
+    if not entries or not queries:
+        return entries[:top_n] if entries else []
+
+    if reranker is None:
+        # 无 reranker：多 query 无意义，按顺序截断
+        return entries[:top_n]
+
+    # 每个 query 至少分到 1 条
+    per_query = max(1, top_n // len(queries))
+    seen: set[str] = set()
+    merged: list[NameIndexEntry] = []
+    by_uuid = {e.uuid: e for e in entries}
+
+    try:
+        from langchain_core.documents import Document
+
+        for q in queries:
+            docs = [
+                Document(page_content=e.text, metadata={"uuid": e.uuid})
+                for e in entries
+                if e.uuid not in seen
+            ]
+            if not docs:
+                continue
+            compressed = reranker.compress_documents(docs, q)
+            for d in compressed[:per_query]:
+                u = d.metadata.get("uuid", "")
+                if u and u in by_uuid and u not in seen:
+                    seen.add(u)
+                    merged.append(by_uuid[u])
+                    if len(merged) >= top_n:
+                        break
+            if len(merged) >= top_n:
+                break
+    except Exception:
+        # reranker 失败：退化到顺序截断
+        return entries[:top_n]
+
+    # 不足 top_n 时用剩余条目按原顺序补足
+    if len(merged) < top_n:
+        for e in entries:
+            if e.uuid not in seen:
+                merged.append(e)
+                seen.add(e)
+                if len(merged) >= top_n:
+                    break
+
+    return merged[:top_n]
+
+
 def _topk_by_text(
     entries: list[NameIndexEntry],
     query: str,
@@ -28,30 +96,27 @@ def _topk_by_text(
 ) -> list[NameIndexEntry]:
     """对一组条目做 top-n 选择。
 
-    - 若有 reranker：先取 top-k * 2，再用 cross-encoder 重排取 top_n
-    - 否则按 entry 长度 + chunk 顺序截断
+    Issue #18.e：改为 multi-query 重排——用 3 个不同视角的 query 各取
+    ``top_n // 3``，合并去重后返回。三视角：
+    1. 人名（``query``，调用方传入）
+    2. 「这个角色最具代表性的说话风格」——抓说话方式
+    3. 「这个角色的外貌/身份/行为特征」——抓外貌与事件
+
+    若 reranker 不可用，退化为按 ``entries`` 原顺序截断 ``top_n``。
     """
     if not entries:
         return []
 
-    if reranker is not None:
-        try:
-            from langchain_core.documents import Document
+    if reranker is None:
+        return entries[:top_n]
 
-            docs = [
-                Document(page_content=e.text, metadata={"uuid": e.uuid, "_idx": i})
-                for i, e in enumerate(entries)
-            ]
-            compressed = reranker.compress_documents(docs, query)
-            # 按压缩后顺序取 top_n
-            ids: list[str] = [d.metadata.get("uuid", "") for d in compressed[:top_n]]
-            by_uuid = {e.uuid: e for e in entries}
-            return [by_uuid[u] for u in ids if u in by_uuid]
-        except Exception:
-            pass
-
-    # 退化：按文本长度 + 顺序
-    return entries[:top_n]
+    # 3 个不同视角的 query
+    queries = [
+        query,
+        "这个角色最具代表性的说话风格",
+        "这个角色的外貌身份与行为特征",
+    ]
+    return _multi_query_rerank(entries, queries, top_n, reranker)
 
 
 def _take(

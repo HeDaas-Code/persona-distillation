@@ -20,6 +20,7 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
+from persona_distillation.intake.embedder import HashEmbeddings
 from persona_distillation.intake.schemas import (
     IndexCategory,
     NameIndexEntry,
@@ -37,8 +38,18 @@ def _table_cols() -> str:
         "char_end INTEGER NOT NULL, "
         "text TEXT NOT NULL, "
         "aliases TEXT NOT NULL DEFAULT '', "
-        "corpus_uuid TEXT NOT NULL DEFAULT ''"
+        "corpus_uuid TEXT NOT NULL DEFAULT '', "
+        "relation_to TEXT, "
+        "co_mentioned TEXT NOT NULL DEFAULT ''"
     )
+
+
+# 读取 entries 时统一选取的列（含关系提取新增列），保证 _row_to_entry 解包一致
+_ENTRY_SELECT_COLS = (
+    "uuid, character_name, category, source, chunk_index, "
+    "char_start, char_end, text, aliases, corpus_uuid, "
+    "relation_to, co_mentioned"
+)
 
 
 class IndexStore:
@@ -96,6 +107,17 @@ class IndexStore:
             )
         except sqlite3.OperationalError:
             pass  # 列已存在
+        # 旧库兼容：entries 表可能没有 relation_to / co_mentioned 列（关系提取新增）
+        try:
+            self._conn.execute("ALTER TABLE entries ADD COLUMN relation_to TEXT")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+        try:
+            self._conn.execute(
+                "ALTER TABLE entries ADD COLUMN co_mentioned TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass  # 列已存在
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_name ON entries(character_name)"
         )
@@ -145,8 +167,9 @@ class IndexStore:
             self._conn.execute(
                 "INSERT OR REPLACE INTO entries "
                 "(uuid, character_name, category, source, chunk_index, "
-                "char_start, char_end, text, aliases, corpus_uuid) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "char_start, char_end, text, aliases, corpus_uuid, "
+                "relation_to, co_mentioned) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     entry.uuid,
                     entry.character_name,
@@ -158,6 +181,8 @@ class IndexStore:
                     entry.text,
                     ",".join(entry.aliases),
                     entry.corpus_uuid,
+                    entry.relation_to,
+                    ",".join(entry.co_mentioned),
                 ),
             )
             self._conn.commit()
@@ -187,11 +212,83 @@ class IndexStore:
                 raise
 
     def add_many(self, entries: Iterable[NameIndexEntry]) -> None:
-        n = 0
-        for e in entries:
-            self.add(e)
-            n += 1
-        logger.info("add_many: 写入 %d 条索引", n)
+        """批量写入索引（单线程，原子化）。
+
+        Issue #16: NER 并行产出 entries 后，由主线程串行调本方法写库——
+        SQLite 并发写会 ``database is locked``，Chroma 并发写可能损坏，
+        所以写库必须串行。本方法把全部 entries 收敛到一次 SQLite 事务 +
+        一次 Chroma ``add_texts`` 调用，比逐条 ``add()`` 快很多（少 N-1 次
+        commit + N-1 次 Chroma round-trip）。
+
+        原子性（继承 P0-3 策略）：Chroma 失败时回滚 SQLite 全部插入。
+        """
+        entries_list = list(entries)
+        if not entries_list:
+            logger.info("add_many: 空列表，跳过")
+            return
+
+        # ---- SQLite 批量插入（单事务）----
+        try:
+            self._conn.execute("BEGIN")
+            for e in entries_list:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO entries "
+                    "(uuid, character_name, category, source, chunk_index, "
+                    "char_start, char_end, text, aliases, corpus_uuid, "
+                    "relation_to, co_mentioned) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        e.uuid,
+                        e.character_name,
+                        e.category.value,
+                        e.source,
+                        e.chunk_index,
+                        e.char_start,
+                        e.char_end,
+                        e.text,
+                        ",".join(e.aliases),
+                        e.corpus_uuid,
+                        e.relation_to,
+                        ",".join(e.co_mentioned),
+                    ),
+                )
+            self._conn.commit()
+        except Exception as e:  # noqa: BLE001
+            # SQLite 失败：回滚事务，不写 Chroma
+            try:
+                self._conn.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+            logger.error("add_many SQLite 批量插入失败: %s", e, exc_info=True)
+            raise
+
+        # ---- Chroma 批量插入 ----
+        if self._collection is not None:
+            try:
+                self._collection.add_texts(
+                    texts=[e.text for e in entries_list],
+                    metadatas=[e.to_metadata() for e in entries_list],
+                    ids=[e.uuid for e in entries_list],
+                )
+            except Exception as e:  # noqa: BLE001
+                # P0-3: 回滚 SQLite（保证一致性）
+                logger.error(
+                    "add_many Chroma 批量写入失败，回滚 SQLite (%d 条): %s",
+                    len(entries_list), e, exc_info=True,
+                )
+                uuids = [e.uuid for e in entries_list]
+                placeholders = ",".join("?" * len(uuids))
+                try:
+                    self._conn.execute(
+                        f"DELETE FROM entries WHERE uuid IN ({placeholders})",
+                        uuids,
+                    )
+                    self._conn.commit()
+                except Exception as rb_e:  # noqa: BLE001
+                    logger.error("add_many SQLite 回滚失败: %s", rb_e, exc_info=True)
+                raise
+
+        logger.info("add_many: 写入 %d 条索引", len(entries_list))
 
     def recover_from_crash(self) -> int:
         """P0-3: 从崩溃恢复 —— 用 SQLite 中的全部 text 重建 Chroma 索引。
@@ -204,8 +301,7 @@ class IndexStore:
             return 0
         try:
             cur = self._conn.execute(
-                "SELECT uuid, character_name, category, source, chunk_index, "
-                "char_start, char_end, text, aliases, corpus_uuid FROM entries"
+                f"SELECT {_ENTRY_SELECT_COLS} FROM entries"
             )
             rows = cur.fetchall()
             for row in rows:
@@ -229,9 +325,7 @@ class IndexStore:
     # ------------------------------------------------------------------
     def get(self, uuid: str) -> NameIndexEntry | None:
         cur = self._conn.execute(
-            "SELECT uuid, character_name, category, source, chunk_index, "
-            "char_start, char_end, text, aliases, corpus_uuid FROM entries "
-            "WHERE uuid=?",
+            f"SELECT {_ENTRY_SELECT_COLS} FROM entries WHERE uuid=?",
             (uuid,),
         )
         row = cur.fetchone()
@@ -244,15 +338,13 @@ class IndexStore:
     ) -> list[NameIndexEntry]:
         if category is None:
             cur = self._conn.execute(
-                "SELECT uuid, character_name, category, source, chunk_index, "
-                "char_start, char_end, text, aliases, corpus_uuid FROM entries "
+                f"SELECT {_ENTRY_SELECT_COLS} FROM entries "
                 "WHERE character_name=? ORDER BY chunk_index, char_start",
                 (character_name,),
             )
         else:
             cur = self._conn.execute(
-                "SELECT uuid, character_name, category, source, chunk_index, "
-                "char_start, char_end, text, aliases, corpus_uuid FROM entries "
+                f"SELECT {_ENTRY_SELECT_COLS} FROM entries "
                 "WHERE character_name=? AND category=? "
                 "ORDER BY chunk_index, char_start",
                 (character_name, category.value),
@@ -260,28 +352,145 @@ class IndexStore:
         return [_row_to_entry(r) for r in cur.fetchall()]
 
     def list_characters(self) -> list[dict[str, Any]]:
-        """聚合视图：人物 → 各类计数。"""
+        """聚合视图：人物 → 各类计数 + aliases 列表。
+
+        每条返回的 dict 包含：
+        - ``character_name``  人物名
+        - ``mention_count``   总提及次数
+        - ``by_category``     ``{category: count}``
+        - ``aliases``         去重后的别名列表（按首次出现顺序）
+        """
         cur = self._conn.execute(
-            "SELECT character_name, category, COUNT(*) AS n FROM entries "
-            "GROUP BY character_name, category"
+            "SELECT character_name, category, COUNT(*) AS n, aliases "
+            "FROM entries GROUP BY character_name, category, aliases"
         )
         agg: dict[str, dict[str, Any]] = {}
-        for name, cat, n in cur.fetchall():
+        alias_seen: dict[str, set[str]] = {}
+        for name, cat, n, aliases_csv in cur.fetchall():
             slot = agg.setdefault(
-                name, {"character_name": name, "mention_count": 0, "by_category": {}}
+                name, {"character_name": name, "mention_count": 0, "by_category": {}, "aliases": []}
             )
             slot["mention_count"] += n
-            slot["by_category"][cat] = n
+            slot["by_category"][cat] = slot["by_category"].get(cat, 0) + n
+            seen = alias_seen.setdefault(name, set())
+            for a in (aliases_csv or "").split(","):
+                a = a.strip()
+                if a and a != name and a not in seen:
+                    seen.add(a)
+                    slot["aliases"].append(a)
         return sorted(agg.values(), key=lambda x: -x["mention_count"])
+
+    # ------------------------------------------------------------------
+    # 跨 chunk 实体归并
+    # ------------------------------------------------------------------
+    def merge_characters(self, source: str, target: str) -> int:
+        """把 ``source`` 人物的全部索引条目并入 ``target``，返回迁移条目数。
+
+        实现细节：
+        1. SQLite ``UPDATE entries SET character_name=target WHERE character_name=source``
+        2. aliases 合并：每条迁移后的条目 aliases 追加 ``source``（去重），
+           保留原 NER 抓到的同块别名，避免丢失身份信息。
+        3. Chroma metadata 同步：best-effort 调 ``update_document`` 刷新
+           ``character_name`` / ``aliases``；Chroma 不可用时只更新 SQLite（留 TODO）。
+
+        Args:
+            source: 被合并的源人物名（合并后消失）。
+            target: 合并目标人物名（合并后保留）。
+
+        Returns:
+            实际迁移的条目数（``source == target`` 或 source 不存在时返回 0）。
+        """
+        if not source or not target or source == target:
+            return 0
+
+        # 取出所有 source 条目（含 uuid + aliases），用于 Chroma 同步
+        cur = self._conn.execute(
+            "SELECT uuid, aliases FROM entries WHERE character_name=?",
+            (source,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return 0
+
+        # 收集 target 现有 aliases（合并后保证 target 也带上 source 名）
+        target_aliases_cur = self._conn.execute(
+            "SELECT aliases FROM entries WHERE character_name=?",
+            (target,),
+        )
+        target_alias_set: set[str] = set()
+        for (csv,) in target_aliases_cur.fetchall():
+            for a in (csv or "").split(","):
+                a = a.strip()
+                if a:
+                    target_alias_set.add(a)
+        target_alias_set.add(source)  # source 名 → target 的别名
+
+        # 逐条更新：character_name=target + aliases 追加 source（去重）
+        for uuid, csv in rows:
+            cur_aliases = [a for a in (csv or "").split(",") if a.strip()]
+            seen: set[str] = set(cur_aliases)
+            merged: list[str] = list(cur_aliases)
+            # source 名作为新别名追加（如果还没有）
+            if source not in seen:
+                merged.append(source)
+                seen.add(source)
+            # target 名本身不作为别名保留（避免循环引用）
+            merged = [a for a in merged if a != target]
+            new_csv = ",".join(merged)
+            self._conn.execute(
+                "UPDATE entries SET character_name=?, aliases=? WHERE uuid=?",
+                (target, new_csv, uuid),
+            )
+        self._conn.commit()
+
+        # ---- Chroma metadata 同步（best-effort）----
+        # TODO: 当 Chroma 启用时，metadata 里的 character_name 也应同步刷新；
+        #       此处用 update_document 尝试，失败只告警不抛错——recover_from_crash
+        #       可在下次启动时由 SQLite 重建 Chroma 兜底。
+        if self._collection is not None:
+            for uuid, _ in rows:
+                try:
+                    # 用最新的 SQLite 条目重建 metadata
+                    entry = self.get(uuid)
+                    if entry is None:
+                        continue
+                    try:
+                        # 优先用 update_document（langchain_chroma 提供）
+                        self._collection.update_document(
+                            document_id=uuid,  # type: ignore[call-arg]
+                            metadata=entry.to_metadata(),
+                        )
+                    except (AttributeError, TypeError):
+                        # 不同版本签名不同；尝试底层 _collection.update
+                        underlying = getattr(self._collection, "_collection", None)
+                        if underlying is not None:
+                            underlying.update(
+                                ids=[uuid],
+                                metadatas=[entry.to_metadata()],
+                            )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "Chroma metadata 同步失败 (uuid=%s source=%s target=%s): %s",
+                        uuid, source, target, e,
+                    )
+
+        return len(rows)
 
     def search(
         self, query: str, character_name: str | None = None, k: int = 10
     ) -> list[NameIndexEntry]:
         """向量检索 + 过滤。
 
-        若 Chroma 不可用，退化到关键词 LIKE 匹配。
+        若 Chroma 不可用，或嵌入模型是 :class:`HashEmbeddings`（离线伪嵌入，
+        向量由文本 hash 派生，相似度无意义），退化到关键词 LIKE 匹配。
         """
-        if self._collection is not None:
+        # HashEmbeddings 的向量由文本 hash 派生，相似度无意义；
+        # 离线模式下跳过向量检索，直接走 SQLite LIKE，避免返回随机结果
+        use_vector = (
+            self._collection is not None
+            and not isinstance(self._embedding, HashEmbeddings)
+        )
+        if use_vector:
             try:
                 where = {"character_name": character_name} if character_name else None
                 docs = self._collection.similarity_search(query, k=k, filter=where)
@@ -296,13 +505,14 @@ class IndexStore:
             except Exception as e:  # noqa: BLE001
                 logger.warning("Chroma similarity_search 失败，退化到 LIKE: %s", e)
 
-        # ---- 关键词 fallback ----
+        # ---- 关键词 fallback（Chroma 不可用 / HashEmbeddings / 向量检索失败）----
+        # 离线模式下用 LIKE 匹配原文 text 与角色名 character_name
+        like = f"%{query}%"
         sql = (
-            "SELECT uuid, character_name, category, source, chunk_index, "
-            "char_start, char_end, text, aliases, corpus_uuid FROM entries "
-            "WHERE text LIKE ?"
+            f"SELECT {_ENTRY_SELECT_COLS} FROM entries "
+            "WHERE (text LIKE ? OR character_name LIKE ?)"
         )
-        params: list[Any] = [f"%{query}%"]
+        params: list[Any] = [like, like]
         if character_name:
             sql += " AND character_name=?"
             params.append(character_name)
@@ -505,6 +715,8 @@ def _row_to_entry(row: tuple) -> NameIndexEntry:
         text,
         aliases,
         corpus_uuid,
+        relation_to,
+        co_mentioned,
     ) = row
     return NameIndexEntry(
         uuid=uuid,
@@ -517,4 +729,6 @@ def _row_to_entry(row: tuple) -> NameIndexEntry:
         text=text,
         aliases=[a for a in aliases.split(",") if a],
         corpus_uuid=corpus_uuid or "",
+        relation_to=relation_to or None,
+        co_mentioned=[c for c in (co_mentioned or "").split(",") if c],
     )

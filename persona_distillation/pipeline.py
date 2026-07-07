@@ -13,17 +13,26 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Issue #10: 分批冷凝阈值——distillate 总数超过此值时走 map-reduce，
+# 避免把 50 文件 × 10 块 = 500 个 distillate（含 summary + evidence）
+# 一次塞进 synthesizer 的 prompt 导致 token 爆炸
+_CONDENSE_BATCH_THRESHOLD = 30
+# Issue #10: 分批冷凝的批大小——map 阶段每批最多处理多少个 distillate
+_CONDENSE_BATCH_SIZE = 20
+
 from persona_distillation.agents import (
     PersonaSkillList,
     PresetDialogueList,
     build_dialogue_writer_agent,
     build_extractor_agent,
+    build_model,
     build_skill_designer_agent,
     build_synthesizer_agent,
     invoke_structured,
 )
 from persona_distillation.chunker import chunk_text
 from persona_distillation.config import DistillationConfig
+from persona_distillation.eval.report import build_report
 from persona_distillation.loader import load_corpus
 from persona_distillation.schemas import (
     Distillate,
@@ -59,6 +68,7 @@ class PersonaDistiller:
         *,
         persona_id: str | None = None,
         output_dir: str | Path | None = None,
+        eval: bool = False,
     ) -> DistillationResult:
         """对 ``input_path``（文件或目录）执行完整蒸馏。
 
@@ -66,6 +76,8 @@ class PersonaDistiller:
             input_path: 语料文件或目录。
             persona_id: 覆盖配置里的人格 ID。
             output_dir: 若给定，蒸馏完成后落盘到该目录。
+            eval: 若 True，蒸馏完成后跑质量评估，把 EvalReport 存入
+                ``metadata["eval_report"]``；评估失败不阻塞蒸馏（仅 log warning）。
         """
         if persona_id:
             self.cfg.persona_id = persona_id
@@ -75,8 +87,31 @@ class PersonaDistiller:
         logger.info("加载 %d 篇文档", len(docs))
 
         # ---- Stage 1: 分馏 ----
-        distillates = self._fractional_distillation(docs)
-        logger.info("分馏完成，共 %d 个分块的蒸馏液", len(distillates))
+        # _fractional_distillation 返回 (distillates, 失败统计)：
+        # 即使部分 chunk 失败也继续尝试其余 chunk，最终在阈值保护处决定是否中止
+        distillates, n_total_chunks, n_failed_chunks, failure_rate = (
+            self._fractional_distillation(docs)
+        )
+        logger.info(
+            "分馏完成，共 %d 个分块的蒸馏液（尝试 %d 块，失败 %d 块，失败率 %.0f%%）",
+            len(distillates),
+            n_total_chunks,
+            n_failed_chunks,
+            failure_rate * 100,
+        )
+        # P0 (#1): 失败率阈值保护——超过 50% 时中止蒸馏，避免带着少量 distillate
+        # 继续 Stage 2，用户无感知地丢失大部分信号
+        if failure_rate > 0.5:
+            logger.error(
+                "分馏失败率 %.0f%% 超过 50%%（%d/%d 块失败），中止蒸馏",
+                failure_rate * 100,
+                n_failed_chunks,
+                n_total_chunks,
+            )
+            raise RuntimeError(
+                f"分馏失败率 {failure_rate:.0%} 超过 50%，中止蒸馏。"
+                f"检查 LLM 配置或语料质量。"
+            )
 
         # ---- Stage 2 & 3: 冷凝 + 提纯 ----
         persona_card = self._condense_and_purify(distillates)
@@ -101,10 +136,31 @@ class PersonaDistiller:
                 "model": self.cfg.model,
                 "n_docs": len(docs),
                 "n_chunks": len(distillates),
+                # P0 (#1): 分馏失败可见性——暴露 chunk 失败统计，
+                # 让下游消费方/用户能感知信号丢失程度
+                "n_total_chunks": n_total_chunks,
+                "n_failed_chunks": n_failed_chunks,
+                "failure_rate": failure_rate,
                 "elapsed_sec": round(time.time() - t0, 1),
                 "workdir": str(self.workdir),
             },
         )
+
+        # ---- 评估（可选，附加步骤，不能让蒸馏崩溃）----
+        # build_model 可能因无 API key 抛 RuntimeError；评估是附加步骤，
+        # 失败时 log warning 但仍正常返回蒸馏结果（metadata 不含 eval_report）。
+        if eval:
+            try:
+                eval_llm = build_model(self.cfg)
+                eval_report = build_report(
+                    persona_card, skills, distillates, llm=eval_llm
+                )
+                result.metadata["eval_report"] = eval_report
+                logger.info(
+                    "评估完成，overall_score=%.3f", eval_report.overall_score
+                )
+            except Exception as e:
+                logger.warning("评估失败，跳过（不影响蒸馏结果）: %s", e)
 
         if output_dir is not None:
             result.save(output_dir)
@@ -114,9 +170,25 @@ class PersonaDistiller:
     # ------------------------------------------------------------------
     # Stage 1: 分馏——逐块抽取
     # ------------------------------------------------------------------
-    def _fractional_distillation(self, docs) -> list[Distillate]:
+    def _fractional_distillation(
+        self, docs
+    ) -> tuple[list[Distillate], int, int, float]:
+        """逐 chunk 调用 extractor 抽取 Distillate。
+
+        即使单个 chunk 失败也继续尝试其余 chunk（P0 #1：避免一次失败拖垮整批），
+        但会统计失败率，由上层 :meth:`distill` 决定是否中止。
+
+        Returns:
+            (distillates, n_total_chunks, n_failed_chunks, failure_rate)
+            - ``n_total_chunks``：实际尝试调用的 chunk 总数（跳过空文档后的）
+            - ``n_failed_chunks``：抛异常被捕获的 chunk 数
+            - ``failure_rate``：``n_failed_chunks / n_total_chunks``；
+              ``n_total_chunks == 0`` 时为 ``0.0``（不除零）
+        """
         agent = self._get_extractor()
         distillates: list[Distillate] = []
+        n_total_chunks = 0
+        n_failed_chunks = 0
         for doc in docs:
             chunks = chunk_text(
                 doc.text,
@@ -127,10 +199,12 @@ class PersonaDistiller:
             if not chunks:
                 continue
             for ch in chunks:
+                n_total_chunks += 1
                 prompt = self._extractor_prompt(doc, ch, len(chunks))
                 try:
                     dist = invoke_structured(agent, prompt, Distillate)
                 except Exception as e:
+                    n_failed_chunks += 1
                     logger.warning(
                         "extractor %s#%d 失败: %s", doc.relpath, ch.index, e
                     )
@@ -146,7 +220,11 @@ class PersonaDistiller:
                 )
                 distillates.append(dist)
                 self._persist_distillate(dist)
-        return distillates
+        # n_total_chunks=0 时不除零，failure_rate=0（空语料不应触发阈值保护）
+        failure_rate = (
+            n_failed_chunks / n_total_chunks if n_total_chunks > 0 else 0.0
+        )
+        return distillates, n_total_chunks, n_failed_chunks, failure_rate
 
     @staticmethod
     def _extractor_prompt(doc, chunk, total: int) -> str:
@@ -167,18 +245,29 @@ class PersonaDistiller:
     # Stage 2 & 3: 冷凝 + 提纯
     # ------------------------------------------------------------------
     def _condense_and_purify(self, distillates: list[Distillate]) -> PersonaCard:
+        """Stage 2 & 3：冷凝 + 提纯。
+
+        Issue #10：当 distillate 总数超过 ``_CONDENSE_BATCH_THRESHOLD`` 时，
+        不再把全部 distillate 一次塞进 synthesizer 的 prompt（50 文件 × 10 块
+        = 500 个 distillate 可能 50k+ tokens，会触发上下文上限）。
+        改为分批冷凝（map-reduce）：
+        - map：把 distillates 切成多批（每批 ≤ ``_CONDENSE_BATCH_SIZE`` 个），
+          每批调一次 synthesizer 产出中间 PersonaCard
+        - reduce：把所有中间 PersonaCard 聚合成最终 PersonaCard
+
+        distillate 总数 ≤ 阈值时仍走原路径（单次 synthesizer 调用），
+        保留小语料场景下的低成本与稳定性。
+        """
         agent = self._get_synthesizer()
-        bundle = self._bundle_distillates(distillates)
-        prompt = (
-            "以下是来自多文件多分块的全部 Distillate（分馏液）。"
-            "请执行冷凝：按 category 分组、合并重复、跨文件互证上调 salience、"
-            "矛盾项择优；再执行提纯：丢弃 salience < "
-            f"{self.cfg.salience_threshold} 的信号，每个 category 保留 3~6 条，"
-            "最后产出 PersonaCard（system_prompt 必须含 [身份]/[性格]/[说话风格]/"
-            "[知识边界]/[情绪模式]/[雷区]/[输出约束] 七段，并附 1~2 段开场白示范）。\n\n"
-            f"【分馏液汇总】\n{bundle}"
-        )
-        card = invoke_structured(agent, prompt, PersonaCard)
+        if len(distillates) > _CONDENSE_BATCH_THRESHOLD:
+            logger.info(
+                "distillate 数 %d 超过阈值 %d，走分批冷凝（map-reduce）",
+                len(distillates),
+                _CONDENSE_BATCH_THRESHOLD,
+            )
+            card = self._condense_by_batches(agent, distillates)
+        else:
+            card = self._condense_single(agent, distillates)
         if not card.error_reply:
             card = card.model_copy(update={"error_reply": self.cfg.default_error_reply})
         # 若用户强指定 persona_id，覆盖之
@@ -198,6 +287,97 @@ class PersonaDistiller:
                 "pipeline._condense_and_purify: backfill_dna_from_system_prompt 失败, exc_info=True",
             )
         return card
+
+    def _condense_single(
+        self, agent: Any, distillates: list[Distillate]
+    ) -> PersonaCard:
+        """单次冷凝：把全部 distillates 拼成一个 prompt 调 synthesizer。
+
+        适用于 distillate 总数 ≤ ``_CONDENSE_BATCH_THRESHOLD`` 的场景（原路径）。
+        """
+        bundle = self._bundle_distillates(distillates)
+        prompt = (
+            "以下是来自多文件多分块的全部 Distillate（分馏液）。"
+            "请执行冷凝：按 category 分组、合并重复、跨文件互证上调 salience、"
+            "矛盾项择优；再执行提纯：丢弃 salience < "
+            f"{self.cfg.salience_threshold} 的信号，每个 category 保留 3~6 条，"
+            "最后产出 PersonaCard（system_prompt 必须含 [身份]/[性格]/[说话风格]/"
+            "[知识边界]/[情绪模式]/[雷区]/[输出约束] 七段，并附 1~2 段开场白示范）。\n\n"
+            f"【分馏液汇总】\n{bundle}"
+        )
+        return invoke_structured(agent, prompt, PersonaCard)
+
+    def _condense_by_batches(
+        self, agent: Any, distillates: list[Distillate]
+    ) -> PersonaCard:
+        """分批冷凝（map-reduce）。
+
+        - map：把 distillates 切成多批（每批 ≤ ``_CONDENSE_BATCH_SIZE`` 个），
+          每批调一次 synthesizer 产出中间 PersonaCard
+        - reduce：调 :meth:`_aggregate_intermediate_cards` 把所有中间
+          PersonaCard 聚合成最终 PersonaCard
+
+        避免 50 文件 × 10 块 = 500 个 distillate 一次塞进单 prompt
+        导致 token 爆炸。
+        """
+        intermediate_cards: list[PersonaCard] = []
+        total_batches = (
+            len(distillates) + _CONDENSE_BATCH_SIZE - 1
+        ) // _CONDENSE_BATCH_SIZE
+        for i in range(0, len(distillates), _CONDENSE_BATCH_SIZE):
+            batch = distillates[i : i + _CONDENSE_BATCH_SIZE]
+            bundle = self._bundle_distillates(batch)
+            prompt = (
+                "以下是 Distillate 的一批（map 阶段，本批 "
+                f"{len(batch)} 个）。请执行冷凝：按 category 分组、合并重复、"
+                "跨文件互证上调 salience、矛盾项择优；再执行提纯：丢弃 salience < "
+                f"{self.cfg.salience_threshold} 的信号，每个 category 保留 3~6 条，"
+                "产出本批的中间 PersonaCard（system_prompt 必须含 [身份]/[性格]/"
+                "[说话风格]/[知识边界]/[情绪模式]/[雷区]/[输出约束] 七段）。\n\n"
+                f"【本批分馏液】\n{bundle}"
+            )
+            batch_card = invoke_structured(agent, prompt, PersonaCard)
+            intermediate_cards.append(batch_card)
+            logger.info(
+                "分批冷凝 map 阶段：%d/%d 批完成（本批 %d 个 distillate）",
+                len(intermediate_cards),
+                total_batches,
+                len(batch),
+            )
+        # reduce 阶段：把所有中间 PersonaCard 聚合成最终 PersonaCard
+        return self._aggregate_intermediate_cards(agent, intermediate_cards)
+
+    def _aggregate_intermediate_cards(
+        self, agent: Any, cards: list[PersonaCard]
+    ) -> PersonaCard:
+        """reduce 阶段：把多个中间 PersonaCard 聚合成最终 PersonaCard。
+
+        把中间 PersonaCard 的 ``system_prompt`` + ``traits_summary`` 拼接，
+        让 synthesizer 产出统一的最终 PersonaCard（合并七段、去重 DNA 字段、
+        择优 traits_summary）。仅有一个中间卡时直接返回，跳过 reduce。
+        """
+        # 只有一个中间卡时无需 reduce，直接返回
+        if len(cards) == 1:
+            return cards[0]
+        parts: list[str] = []
+        for idx, c in enumerate(cards, 1):
+            parts.append(
+                f"### 中间 PersonaCard #{idx}\n"
+                f"system_prompt:\n{c.system_prompt}\n\n"
+                f"traits_summary: {c.traits_summary}"
+            )
+        bundle = "\n\n".join(parts)
+        prompt = (
+            "以下是分批冷凝产出的多个中间 PersonaCard（reduce 阶段）。"
+            "请把它们聚合成一个最终 PersonaCard：合并 system_prompt 的七段标记，"
+            "去重 + 择优 traits_summary，归并 DNA 字段（expression_dna / "
+            "mental_models / anti_patterns / honest_boundaries / "
+            "decision_heuristics），丢弃冲突或冗余项，最后产出统一 PersonaCard"
+            "（system_prompt 必须含 [身份]/[性格]/[说话风格]/"
+            "[知识边界]/[情绪模式]/[雷区]/[输出约束] 七段，并附 1~2 段开场白示范）。\n\n"
+            f"【中间 PersonaCard 汇总】\n{bundle}"
+        )
+        return invoke_structured(agent, prompt, PersonaCard)
 
     @staticmethod
     def _bundle_distillates(distillates: list[Distillate]) -> str:
