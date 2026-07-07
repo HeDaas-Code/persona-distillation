@@ -1,17 +1,16 @@
 """``interview.run_interview`` 单元测试。
 
-风格沿用 ``tests/test_chunk_cache.py``：``assert`` + ``try/except`` + ``main`` 聚合，
-不强制 pytest 框架（但函数名 ``test_*`` 也兼容 pytest 收集）。
-所有 LLM 路径走 ``FakeLLM``，不调真实 API。
+Issue #13：已转为 pytest 风格——``test_*`` 函数由 pytest 自动收集，
+直接用 ``assert`` 断言，不再需要 ``main()`` / ``try/except`` 包装。
+所有 LLM 路径走 ``FakeInterviewLLM``，不调真实 API。
 
-跑法：``python -m tests.test_interview`` 或 ``python -m pytest tests/test_interview.py -v``
+跑法：``python -m pytest tests/test_interview.py -v``
 """
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from persona_distillation.intake.interview import run_interview
 from persona_distillation.intake.oc_writer import OCSetting
@@ -141,7 +140,6 @@ def test_run_interview_creates_markdown() -> None:
         assert f"**{setting.name}**" in content, (
             f"interview.md 缺 '**{setting.name}**'，内容: {content!r}"
         )
-    print("[PASS] test_run_interview_creates_markdown")
 
 
 def test_run_interview_skeleton_not_found() -> None:
@@ -160,7 +158,6 @@ def test_run_interview_skeleton_not_found() -> None:
             assert "请先调 generate_oc_corpus" in msg, (
                 f"FileNotFoundError 消息应含 '请先调 generate_oc_corpus'，实际: {msg!r}"
             )
-            print("[PASS] test_run_interview_skeleton_not_found")
             return
         except Exception as e:  # noqa: BLE001
             raise AssertionError(
@@ -198,47 +195,3 @@ def test_run_interview_returns_correct_rounds() -> None:
         assert llm.answer_calls == n_rounds, (
             f"character_player 调用次数应为 {n_rounds}，实际 {llm.answer_calls}"
         )
-    print("[PASS] test_run_interview_returns_correct_rounds")
-
-
-# ---------------------------------------------------------------------------
-# 入口
-# ---------------------------------------------------------------------------
-def main() -> int:
-    tests: list[tuple[str, Callable[[], None]]] = [
-        ("test_run_interview_creates_markdown", test_run_interview_creates_markdown),
-        ("test_run_interview_skeleton_not_found", test_run_interview_skeleton_not_found),
-        ("test_run_interview_returns_correct_rounds", test_run_interview_returns_correct_rounds),
-    ]
-
-    results: list[tuple[str, bool, str]] = []
-    for name, fn in tests:
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            import traceback
-            tb = traceback.format_exc()
-            results.append((name, False, f"{type(e).__name__}: {e}\n{tb}"))
-            print(f"[FAIL] {name}  →  {type(e).__name__}: {e}")
-            print(tb)
-        else:
-            results.append((name, True, ""))
-
-    print()
-    print("=" * 70)
-    passed = sum(1 for _, ok, _ in results if ok)
-    failed = sum(1 for _, ok, _ in results if not ok)
-    print(f"总计：{passed} 通过 / {failed} 失败 / {len(results)} 项")
-    print("=" * 70)
-    if failed:
-        print("\n失败项：")
-        for name, ok, detail in results:
-            if not ok:
-                print(f"  - {name}  {detail.splitlines()[0]}")
-        return 1
-    print("\n所有 interview 测试通过 ✓")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

@@ -1,17 +1,16 @@
 """``oc_writer.generate_oc_corpus`` / ``OCSetting.to_prompt_text`` 单元测试。
 
-风格沿用 ``tests/test_chunk_cache.py``：``assert`` + ``try/except`` + ``main`` 聚合，
-不强制 pytest 框架（但函数名 ``test_*`` 也兼容 pytest 收集）。
+Issue #13：已转为 pytest 风格——``test_*`` 函数由 pytest 自动收集，
+直接用 ``assert`` 断言，不再需要 ``main()`` / ``try/except`` 包装。
 所有 LLM 路径走 ``FakeLLM``，不调真实 API。
 
-跑法：``python -m tests.test_oc_writer`` 或 ``python -m pytest tests/test_oc_writer.py -v``
+跑法：``python -m pytest tests/test_oc_writer.py -v``
 """
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from persona_distillation.intake.oc_writer import OCSetting, generate_oc_corpus
 
@@ -84,7 +83,6 @@ def test_oc_setting_to_prompt_text() -> None:
     # 6 个字段标签都应在
     for label in ("姓名", "年龄", "背景", "性格核心", "世界观", "口头禅"):
         assert label in text, f"to_prompt_text 缺标签 {label}: {text!r}"
-    print("[PASS] test_oc_setting_to_prompt_text")
 
 
 def test_generate_oc_corpus_creates_4_files() -> None:
@@ -138,7 +136,6 @@ def test_generate_oc_corpus_creates_4_files() -> None:
                 f"word_counts[{key}]={result['word_counts'][key]} "
                 f"与正文长度 {len(expected_body)} 不符"
             )
-    print("[PASS] test_generate_oc_corpus_creates_4_files")
 
 
 def test_generate_oc_corpus_llm_called_4_times() -> None:
@@ -150,7 +147,6 @@ def test_generate_oc_corpus_llm_called_4_times() -> None:
         assert llm.call_count == 4, (
             f"应调 LLM 4 次（4 个 writer），实际 {llm.call_count}"
         )
-    print("[PASS] test_generate_oc_corpus_llm_called_4_times")
 
 
 def test_generate_oc_corpus_llm_list_content() -> None:
@@ -168,7 +164,6 @@ def test_generate_oc_corpus_llm_list_content() -> None:
         assert "这是 list 格式 content 的正文。" in body, (
             f"list content 未被正确解析，文件内容: {body!r}"
         )
-    print("[PASS] test_generate_oc_corpus_llm_list_content")
 
 
 def test_generate_oc_corpus_llm_failure() -> None:
@@ -182,55 +177,8 @@ def test_generate_oc_corpus_llm_failure() -> None:
             assert "fake LLM down" in str(e), (
                 f"应透传 RuntimeError，实际: {e!r}"
             )
-            print("[PASS] test_generate_oc_corpus_llm_failure")
             return
-        except Exception as e:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             # 允许被包装成别的异常类型，但必须向上抛
-            print(f"[PASS] test_generate_oc_corpus_llm_failure (wrapped as {type(e).__name__})")
             return
     raise AssertionError("LLM 抛异常时 generate_oc_corpus 应向上抛，但未抛")
-
-
-# ---------------------------------------------------------------------------
-# 入口
-# ---------------------------------------------------------------------------
-def main() -> int:
-    tests: list[tuple[str, Callable[[], None]]] = [
-        ("test_oc_setting_to_prompt_text", test_oc_setting_to_prompt_text),
-        ("test_generate_oc_corpus_creates_4_files", test_generate_oc_corpus_creates_4_files),
-        ("test_generate_oc_corpus_llm_called_4_times", test_generate_oc_corpus_llm_called_4_times),
-        ("test_generate_oc_corpus_llm_list_content", test_generate_oc_corpus_llm_list_content),
-        ("test_generate_oc_corpus_llm_failure", test_generate_oc_corpus_llm_failure),
-    ]
-
-    results: list[tuple[str, bool, str]] = []
-    for name, fn in tests:
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            import traceback
-            tb = traceback.format_exc()
-            results.append((name, False, f"{type(e).__name__}: {e}\n{tb}"))
-            print(f"[FAIL] {name}  →  {type(e).__name__}: {e}")
-            print(tb)
-        else:
-            results.append((name, True, ""))
-
-    print()
-    print("=" * 70)
-    passed = sum(1 for _, ok, _ in results if ok)
-    failed = sum(1 for _, ok, _ in results if not ok)
-    print(f"总计：{passed} 通过 / {failed} 失败 / {len(results)} 项")
-    print("=" * 70)
-    if failed:
-        print("\n失败项：")
-        for name, ok, detail in results:
-            if not ok:
-                print(f"  - {name}  {detail.splitlines()[0]}")
-        return 1
-    print("\n所有 oc_writer 测试通过 ✓")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

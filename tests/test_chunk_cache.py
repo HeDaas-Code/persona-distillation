@@ -3,18 +3,26 @@
 覆盖 SubTask 7.1-7.4：
   7.1  _normalize_llm_output 三种格式 + chunk UUID 确定性
   7.2  IndexStore 缓存方法往返一致性
-  7.3  集成：首次 5 块 → 第二次跳过 5 块
-  7.4  集成：max_chunks=3 续传
+  7.3  集成：load_and_chunk + index_characters 端到端（Phase 1 重构后重写）
+  7.4  集成：index_characters 增量分批写库（Phase 1 重构后重写）
 
 跑法：``.venv/bin/python -m tests.test_chunk_cache``
 
 风格沿用 ``tests/smoke_test.py``：简单 print + assert + 返回码，
 不强制 pytest 框架（但函数名 ``test_*`` 也兼容 pytest 收集）。
 所有 LLM 路径走 ``offline=True`` 启发式 NER，不依赖 API key。
+
+注：Phase 1 重构（#15）移除了 ``intake_corpus`` 工具，新流程是
+``load_and_chunk``（分块，不做 NER）+ ``task(intake_ner)`` SubAgent 批量 NER
++ ``index_characters``（写库）。旧 7.3/7.4 测的「intake_corpus 缓存命中跳过」
+逻辑已不适用，改为测新流程的端到端 + 增量写库。chunk-progress-cache 的
+底层基础设施（register_corpus / is_chunk_processed / mark_chunk_processed /
+get_corpus_progress / update_corpus_progress）仍保留在 IndexStore，由 7.2 覆盖。
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -206,9 +214,19 @@ def test_index_store_cache_roundtrip() -> None:
 
 
 # ---------------------------------------------------------------------------
-# SubTask 7.3: 集成 — 首次 5 块 → 第二次跳过 5 块
+# SubTask 7.3（重写）: 集成 — load_and_chunk + index_characters 端到端
 # ---------------------------------------------------------------------------
-def test_integration_first_run_then_skip_all() -> None:
+def test_integration_load_and_chunk_then_index() -> None:
+    """Phase 1 重构后重写：旧 7.3 测的 intake_corpus 缓存命中已不适用。
+
+    新流程：load_and_chunk（分块）→ 合成 NerBatchResult（模拟 intake_ner
+    SubAgent 产出）→ index_characters（写库）→ list_characters（查询）。
+
+    验证：
+    - load_and_chunk 返回合法 chunks JSON（5 块）
+    - index_characters 把全部 5 个 chunk 的 mentions 写入 IndexStore
+    - 写入后 store.count() == 5，list_characters 能查到 5 位人物
+    """
     from persona_distillation.config import DistillationConfig
     from persona_distillation.intake.tools import build_intake_context, build_intake_tools
 
@@ -218,65 +236,79 @@ def test_integration_first_run_then_skip_all() -> None:
         )
         ctx = build_intake_context(cfg)
         tools = build_intake_tools(ctx)
-        intake = [t for t in tools if t.name == "intake_corpus"][0]
+        load_and_chunk = [t for t in tools if t.name == "load_and_chunk"][0]
+        index_characters = [t for t in tools if t.name == "index_characters"][0]
+        list_characters = [t for t in tools if t.name == "list_characters"][0]
 
         # 写能切成 5 块的测试文件
         test_file = _make_corpus_file(Path(td), n_paragraphs=5)
 
-        # 加载并取 corpus_uuid（用于后面查 progress）
-        from persona_distillation.loader import load_corpus
-        docs = load_corpus(test_file)
-        assert len(docs) == 1
-        corpus_uuid = docs[0].corpus_uuid
-        assert corpus_uuid, "LoadedDoc 应已算出 corpus_uuid"
+        # ---- 第 1 步: load_and_chunk 拿到 chunks JSON（不做 NER）----
+        r1 = load_and_chunk.invoke({"path": str(test_file)})
+        chunks = json.loads(r1)
+        assert len(chunks) == 5, f"应切出 5 块，实际 {len(chunks)}"
+        # 每块应带 chunk_meta 字段（供后续 index_characters 透传）
+        for c in chunks:
+            assert "source" in c and "chunk_index" in c and "corpus_uuid" in c
+            assert "char_start" in c and "content_hash" in c and "total_chunks" in c
 
-        # ---- 第一次调用：处理全部 5 块 ----
-        r1 = intake.invoke({"path": str(test_file)})
-        # 验证全部处理，无跳过、无剩余
-        assert "5/5 块" in r1, f"第一次应处理 5/5 块，输出: {r1}"
-        assert "跳过" not in r1, f"第一次不应有跳过，输出: {r1}"
-        assert "剩余" not in r1, f"第一次不应有剩余，输出: {r1}"
+        # ---- 第 2 步: 合成 NerBatchResult（模拟 intake_ner SubAgent 产出）----
+        # 每个 chunk 构造 1 条 mention，用 chunk 文本前 20 字符作 evidence
+        ner_items = []
+        for chunk in chunks:
+            evidence = chunk["text"][:20]
+            ner_items.append({
+                "chunk_meta": {
+                    "source": chunk["source"],
+                    "chunk_index": chunk["chunk_index"],
+                    "char_start": chunk["char_start"],
+                    "corpus_uuid": chunk["corpus_uuid"],
+                    "content_hash": chunk["content_hash"],
+                    "total_chunks": chunk["total_chunks"],
+                },
+                "mentions": [{
+                    "name": f"张三{chunk['chunk_index']}号",
+                    "aliases": [],
+                    "category": "event",
+                    "evidence": evidence,
+                    "char_start": 0,
+                    "char_end": len(evidence),
+                }],
+            })
+        ner_json = json.dumps({"items": ner_items}, ensure_ascii=False)
 
-        # 验证 progress 是 (5, 5)
-        processed, total = ctx.store.get_corpus_progress(corpus_uuid)
-        assert total == 5, f"总块数应是 5，实际 {total}"
-        assert processed == 5, f"已处理应是 5，实际 {processed}"
+        # ---- 第 3 步: index_characters 写库 ----
+        r2 = index_characters.invoke({"ner_results_json": ner_json})
+        assert "索引建立完成" in r2, f"应提示索引建立完成，输出: {r2}"
+        assert "5 个 chunk" in r2, f"应处理 5 个 chunk，输出: {r2}"
 
-        # 记下第一次的索引条数，第二次不应增加
-        count_after_first = ctx.store.count()
-        assert count_after_first > 0, "第一次应写入索引"
-
-        # ---- 第二次同路径调用：跳过全部 5 块 ----
-        r2 = intake.invoke({"path": str(test_file)})
-        assert "5/5 块" in r2, f"第二次也应 5/5（全部跳过），输出: {r2}"
-        assert "跳过 5 块" in r2, f"第二次应跳过 5 块，输出: {r2}"
-        # 第二次不应新增任何索引
-        count_after_second = ctx.store.count()
-        assert count_after_second == count_after_first, (
-            f"第二次不应新增索引：第一次 {count_after_first}，"
-            f"第二次 {count_after_second}"
+        # 验证索引库有 5 条索引（每 chunk 1 条 mention）
+        assert ctx.store.count() == 5, (
+            f"应有 5 条索引，实际 {ctx.store.count()}"
         )
-        # 第二次「新增 X 条提及」中的 X 应为 0（全部跳过）
-        # 检查单文件汇总行：跳过场景下 file_line 仍包含「新增 0 条提及」
-        assert "新增 0 条提及" in r2, (
-            f"全部跳过时新增 mention 应为 0，输出: {r2}"
-        )
 
-        # progress 仍是 (5, 5)
-        processed2, total2 = ctx.store.get_corpus_progress(corpus_uuid)
-        assert (processed2, total2) == (5, 5), (
-            f"第二次后 progress 仍应是 (5,5)，实际 ({processed2},{total2})"
-        )
+        # ---- 第 4 步: list_characters 能查到 5 位人物 ----
+        r3 = list_characters.invoke({})
+        assert "5 位人物" in r3, f"应识别 5 位人物，输出: {r3}"
 
         ctx.store.close()
 
-    print("[7.3] 集成：首次 5 块 → 第二次跳过 5 块 OK")
+    print("[7.3] 集成：load_and_chunk + index_characters 端到端 OK")
 
 
 # ---------------------------------------------------------------------------
-# SubTask 7.4: 集成 — max_chunks=3 续传
+# SubTask 7.4（重写）: 集成 — index_characters 增量分批写库
 # ---------------------------------------------------------------------------
-def test_integration_max_chunks_resume() -> None:
+def test_integration_index_characters_incremental() -> None:
+    """Phase 1 重构后重写：旧 7.4 测的 max_chunks 续传已不适用。
+
+    新流程下 SubAgent 一次性接收全部 chunk，不再有 max_chunks 概念。但
+    index_characters 仍可被多次调用以增量建索引（例如大体量语料分批处理）。
+    本测试验证：
+    - 第一次 index_characters 写入前 3 个 chunk 的 mentions → 3 条索引
+    - 第二次 index_characters 写入后 3 个 chunk 的 mentions → 累计 6 条
+    - 两次调用互不干扰，索引库最终含全部 6 条索引
+    """
     from persona_distillation.config import DistillationConfig
     from persona_distillation.intake.tools import build_intake_context, build_intake_tools
 
@@ -286,65 +318,65 @@ def test_integration_max_chunks_resume() -> None:
         )
         ctx = build_intake_context(cfg)
         tools = build_intake_tools(ctx)
-        intake = [t for t in tools if t.name == "intake_corpus"][0]
+        load_and_chunk = [t for t in tools if t.name == "load_and_chunk"][0]
+        index_characters = [t for t in tools if t.name == "index_characters"][0]
 
         # 写能切成 6 块的测试文件
         test_file = _make_corpus_file(Path(td), n_paragraphs=6)
 
-        from persona_distillation.loader import load_corpus
-        docs = load_corpus(test_file)
-        corpus_uuid = docs[0].corpus_uuid
+        # load_and_chunk 拿到 6 块
+        r1 = load_and_chunk.invoke({"path": str(test_file)})
+        chunks = json.loads(r1)
+        assert len(chunks) == 6, f"应切出 6 块，实际 {len(chunks)}"
 
-        # ---- 第一次调用：max_chunks=3，处理 3 块，剩余 3 块 ----
-        r1 = intake.invoke({"path": str(test_file), "max_chunks": 3})
-        # 应处理 3 块，剩余 3 块（6 - 3）
-        assert "剩余" in r1, f"第一次 max_chunks=3 应有剩余，输出: {r1}"
-        assert "剩余 3 块" in r1, f"第一次应剩余 3 块，输出: {r1}"
-        # 不应有跳过（首次调用，无缓存）
-        assert "跳过" not in r1, f"第一次不应有跳过，输出: {r1}"
-        # 验证 progress 是 (3, 6)
-        processed1, total1 = ctx.store.get_corpus_progress(corpus_uuid)
-        assert (processed1, total1) == (3, 6), (
-            f"第一次后 progress 应是 (3,6)，实际 ({processed1},{total1})"
-        )
+        def _build_ner_json(chunk_subset: list[dict]) -> str:
+            """从 chunk 子集合成 NerBatchResult JSON。"""
+            items = []
+            for chunk in chunk_subset:
+                evidence = chunk["text"][:20]
+                items.append({
+                    "chunk_meta": {
+                        "source": chunk["source"],
+                        "chunk_index": chunk["chunk_index"],
+                        "char_start": chunk["char_start"],
+                        "corpus_uuid": chunk["corpus_uuid"],
+                        "content_hash": chunk["content_hash"],
+                        "total_chunks": chunk["total_chunks"],
+                    },
+                    "mentions": [{
+                        "name": f"张三{chunk['chunk_index']}号",
+                        "aliases": [],
+                        "category": "event",
+                        "evidence": evidence,
+                        "char_start": 0,
+                        "char_end": len(evidence),
+                    }],
+                })
+            return json.dumps({"items": items}, ensure_ascii=False)
 
-        count_after_first = ctx.store.count()
-
-        # ---- 第二次调用：max_chunks=3，跳过 3 块 + 处理 3 新块 ----
-        r2 = intake.invoke({"path": str(test_file), "max_chunks": 3})
-        # 第二次应有跳过（前 3 块缓存命中）
-        assert "跳过" in r2, f"第二次应有跳过（前 3 块缓存命中），输出: {r2}"
-        assert "跳过 3 块" in r2, f"第二次应跳过 3 块，输出: {r2}"
-        # 第二次处理完剩余 3 块，不应再有剩余
-        assert "剩余" not in r2, (
-            f"第二次处理完最后 3 块后不应有剩余，输出: {r2}"
-        )
-        # 第二次应新增索引（处理了 3 个新 chunk）
-        count_after_second = ctx.store.count()
-        assert count_after_second > count_after_first, (
-            f"第二次应新增索引：第一次 {count_after_first}，"
-            f"第二次 {count_after_second}"
-        )
-        # 验证 progress 是 (6, 6)
-        processed2, total2 = ctx.store.get_corpus_progress(corpus_uuid)
-        assert (processed2, total2) == (6, 6), (
-            f"第二次后 progress 应是 (6,6)，实际 ({processed2},{total2})"
+        # ---- 第一次: 写入前 3 块 ----
+        ner_json_1 = _build_ner_json(chunks[:3])
+        r2 = index_characters.invoke({"ner_results_json": ner_json_1})
+        assert "3 个 chunk" in r2, f"第一次应处理 3 个 chunk，输出: {r2}"
+        assert ctx.store.count() == 3, (
+            f"第一次后应有 3 条索引，实际 {ctx.store.count()}"
         )
 
-        # ---- 第三次调用：max_chunks=3，应全部跳过（已全部处理）----
-        r3 = intake.invoke({"path": str(test_file), "max_chunks": 3})
-        assert "跳过" in r3, f"第三次应全部跳过，输出: {r3}"
-        assert "剩余" not in r3, f"第三次不应有剩余，输出: {r3}"
-        # 索引数不应变化
-        count_after_third = ctx.store.count()
-        assert count_after_third == count_after_second, (
-            f"第三次不应新增索引：第二次 {count_after_second}，"
-            f"第三次 {count_after_third}"
+        # ---- 第二次: 写入后 3 块（增量）----
+        ner_json_2 = _build_ner_json(chunks[3:])
+        r3 = index_characters.invoke({"ner_results_json": ner_json_2})
+        assert "3 个 chunk" in r3, f"第二次应处理 3 个 chunk，输出: {r3}"
+        assert ctx.store.count() == 6, (
+            f"第二次后应有 6 条索引，实际 {ctx.store.count()}"
         )
+
+        # 验证 6 位人物都识别到了（张三0号 ~ 张三5号）
+        chars = ctx.store.list_characters()
+        assert len(chars) == 6, f"应有 6 位人物，实际 {len(chars)}"
 
         ctx.store.close()
 
-    print("[7.4] 集成：max_chunks=3 续传 OK")
+    print("[7.4] 集成：index_characters 增量分批写库 OK")
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +386,8 @@ def main() -> int:
     tests = [
         ("7.1", test_normalize_llm_output_and_chunk_uuid),
         ("7.2", test_index_store_cache_roundtrip),
-        ("7.3", test_integration_first_run_then_skip_all),
-        ("7.4", test_integration_max_chunks_resume),
+        ("7.3", test_integration_load_and_chunk_then_index),
+        ("7.4", test_integration_index_characters_incremental),
     ]
     failures: list[str] = []
     for label, fn in tests:

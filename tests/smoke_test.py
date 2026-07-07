@@ -3,7 +3,13 @@
 跑通即说明：schemas/loader/chunker/skills_writer/triple_verification/renderer
 全部 import 成功、数据结构合法、DNA 级别 SKILL.md 能正确生成。
 
-CI 用：python -m tests.smoke_test
+集成测试套件——有顺序依赖，不要拆成独立 pytest 函数：
+- Test 2 构造的 ``m`` / ``bad`` (MentalModel) 被 Test 4 / 5 / 6 / 11 复用
+- Test 5 构造的 ``sk`` (PersonaSkill) 被 Test 6 复用
+- Test 1 失败时直接 return（后续 import 缺失，跑下去无意义）
+
+跑法：``python -m tests.smoke_test``（不要用 pytest 收集，本文件无 ``test_*``
+函数，pytest 只会静默跳过——所有断言都在 ``main()`` 内顺序执行）。
 """
 from __future__ import annotations
 

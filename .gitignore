@@ -43,6 +43,9 @@ architecture.html
 .DS_Store
 Thumbs.db
 
+# Git bundle（不应提交）
+*.bundle
+
 # 缓存
 .pytest_cache/
 .mypy_cache/
