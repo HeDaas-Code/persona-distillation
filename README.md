@@ -17,486 +17,301 @@
 
 ---
 
-> **两种工作模式**：
+## 三种工作模式
+
+> **CLI 直跑模式**（确定性、可复现）—— `distill` 子命令一键完成整套蒸馏。
 >
-> - **CLI 直跑模式**（确定性、可复现）—— `distill` 子命令一键完成整套蒸馏。
-> - **主理人 Agent 模式**（交互式）—— `chat` 子命令启动 intake 子包，
->   先做人物识别 + 索引 + 档案，让用户从候选人物里选一位再蒸馏。
-> - **WebUI 调试模式**（可视化）—— `webui` 子命令启动 Gradio 三 Tab 面板：
->   蒸馏参数表单 + 产物浏览（DNA 五层/Skills/对话）+ 主理人 Agent 对话。
-> - **OC 共创蒸馏模式**（生成式）—— `cocreate` 子命令一键走完三阶段：
->   4 个 sub-agent 据用户设定的 OC 生成"骨架"文本（独白/对话/事件/回忆）→
->   character_player sub-agent 接受主理人 N 轮访谈产出"血肉"记录 →
->   合并语料走现有四阶段蒸馏。适用于想蒸馏一个虚构角色（OC）但手上没有现成语料的场景。
-> - **质量评估模式**（量化还原度）—— `eval` 子命令对已落盘产物跑三维度评估
->   （覆盖度 / 忠实度 / 可识别度），产出 `eval_report.json`；`--offline` 时只跑覆盖度，不调 LLM。
+> **主理人 Agent 模式**（交互式）—— `chat` 子命令启动 intake 子包，先做人物识别 + 索引 + 档案，让用户从候选人物里选一位再蒸馏。
 >
-> **灵感**：Skills 生成逻辑参考 [nuwa-skill](https://github.com/alchaincyf/nuwa-skill) 的认知操作系统方法论——
-> 捕捉的是 _HOW they think_，不是 _WHAT they said_。
-> 每个人格 Skill 是一套可运行的认知操作系统，而非语录合集。
-
-## § 01 · 方法论
-
-借蒸馏四阶，把原文里散落的"人"析出来。
-
-| 阶段 | 隐喻 | 执行者 | 产出 |
-|:---:|:---|:---|:---|
-| **STAGE 01** | 🔥 分馏 `Fractional Distillation` | `extractor` 子智能体 | 每块文本按 10 类塔板分离信号，附原文证据与显著度 |
-| **STAGE 02** | ❄ 冷凝 `Condensation` | `synthesizer` 子智能体 | 同类合并、跨文件互证（salience 上调）、矛盾择优 |
-| **STAGE 03** | ❄ 提纯 `Purification` | `synthesizer` 子智能体 | 丢弃低显著信号，每类保留 3~6 条，**同步提炼 DNA 五层** |
-| **STAGE 04** | 📜 成品 `Final Product` | `skill_designer` + `dialogue_writer` | 把 DNA 五层灌装为可运行 PersonaSkill + 预设对话 |
-
-### DNA 五层认知操作系统（参考 nuwa-skill）
-
-提纯阶段不再只产出 `system_prompt`，而是同步提炼人物的**认知操作系统**：
-
-| 层 | 内容 | 体现 |
-|:---:|:---|:---|
-| 🗣️ **表达 DNA** | `ExpressionDNA` | 语气、节奏、用词偏好、标志性比喻、开场白示范 |
-| 🧠 **心智模型** | `MentalModel[]` | 3~7 个看世界的"镜片"，**须经三重验证才收录** |
-| ⚖️ **决策启发式** | `DecisionHeuristic[]` | 推理捷径与判断规则 |
-| 🚫 **反模式** | `AntiPattern[]` | 绝对不会做什么——比正向规则更能勾勒人格边界 |
-| 📏 **诚实边界** | `HonestBoundary[]` | skill 真正做不到什么（一个不说明自身局限的 skill 不值得信任） |
-
-### 三重验证法（Triple Verification）
-
-候选心智模型必须**同时**通过三项才会被收录，宁缺毋滥，避免把通用常识误当人格特质：
-
-| 验证 | 标准 | 示例 |
-|:---:|:---|:---|
-| 🔄 **跨域复现** | 该模型在此人讨论的 **≥2 个不同领域**出现（一次性表态不算） | 纳瓦尔的"杠杆"——在财富/个人成长/职业选择三域复现 |
-| 🧠 **有生成力** | 能推断此人对**新问题**的立场，而非只描述既有观点 | 芒格的"逆向思维"——面对"如何成功"→他先想"如何确保失败" |
-| 🎯 **有排他性** | 不是所有聪明人都会这样想，体现独特视角 | "反脆弱"是塔勒布的，不是通用智慧 |
-
-未通过的一律丢弃。框架用 `triple_verification.py` 对 LLM 初判做规则式复核：
-跨域用 distillates 证据收集、生成力与排他性要求 LLM 必须给出示例文本。
-
----
-
-## § 02 · 管线全景
-
-从一摞语料，到一张可注入的人格卡。`chat` 模式在前面多了一层 intake 预处理。
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  PRE-STAGE · INTAKE 预处理 (仅 chat 模式)              ↻ MiniMax-M3      │
-│                                                                         │
-│  语料 ──→ chunk ──→ NER/Classifier ──→ Chroma+SQLite ──→ Profile     │
-│         intake 子包   人物 + 类别     跨文件聚合        候选档案        │
-│         name_extractor  speech·       index_store       profile_builder│
-│                       appearance·                       + reranker    │
-│                       event                             top-k 选段    │
-└─────────────────────────────────────────────────────────────────────────┘
-                                  ⇣
-┌─────────────────────────────────────────────────────────────────────────┐
-│  INPUT LAYER · 摄入层                          ↻ MiniMax-M3              │
-│                                                                         │
-│  语料/Corpus ──→ load_corpus() ──→ chunk_text() ──→ Chunks[]            │
-│  txt·md·json·csv   loader.py       chunker.py        tiktoken感知分块    │
-│                                            10 塔板:                    │
-│                                            speech·catch·values·know    │
-│                                            emo·rel·event·bg·taboo·man  │
-└─────────────────────────────────────────────────────────────────────────┘
-                                  ⇣
-┌─────────────────────────────────────────────────────────────────────────┐
-│  ① STAGE · 分馏 FRACTIONAL DISTILLATION              🔥 heat applied    │
-│                                                                         │
-│              ┌──────────────┐    ●●● 10塔板    ┌──────────────┐         │
-│              │  extractor   │ ──→ 滴滴 ──→     │  Distillate[]│         │
-│              │  分馏器子智能体│                  │  蒸馏液       │         │
-│              └──────────────┘                  └──────────────┘         │
-│              agents.py                         signals·evidence·salience │
-│              response_format=Distillate        落盘 distillates/*.json   │
-└─────────────────────────────────────────────────────────────────────────┘
-                                  ⇣
-┌─────────────────────────────────────────────────────────────────────────┐
-│  ②③ STAGE · 冷凝 CONDENSATION ⟶ 提纯 PURIFICATION   ❄ salience ≥ 0.35  │
-│                                                                         │
-│   ┌──────────────────┐    ⟶    ┌──────────────────────────────────┐    │
-│   │   synthesizer    │         │        PersonaCard               │    │
-│   │   冷凝·提纯器     │         │   persona_id · system_prompt     │    │
-│   │                  │         │   error_reply · tags             │    │
-│   │  冷凝:同类合并    │         │   ┌────────────────────────────┐ │    │
-│   │      跨文件互证   │         │   │  + DNA 五层认知操作系统     │ │    │
-│   │  提纯:丢低显著    │         │   │  ExpressionDNA              │ │    │
-│   │      取3~6条      │         │   │  MentalModel[] ←三重验证    │ │    │
-│   └──────────────────┘         │   │  DecisionHeuristic[]        │ │    │
-│                                │   │  AntiPattern[]              │ │    │
-│                                │   │  HonestBoundary[]           │ │    │
-│                                │   └────────────────────────────┘ │    │
-│                                └──────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
-                                  ⇣  三重验证过滤未通过模型
-                                  ⇣  ★ DNA BACKFILL (安全网) ★
-                                  ⇣    若 LLM 把 DNA 拼到 system_prompt 文本
-                                  ⇣    6 类节标题正则 → 5 字段回填
-┌─────────────────────────────────────────────────────────────────────────┐
-│  ④ STAGE · 成品 FINAL PRODUCT — 灌装 DNA 级别 Skills 与预设对话          │
-│                                                                         │
-│   ┌─────────────────────────┐    ┌─────────────────────────┐           │
-│   │    skill_designer       │    │    dialogue_writer      │           │
-│   │    技能设计师(DNA级)     │    │    预设对话作者          │           │
-│   │                         │    │                         │           │
-│   │  response_format=       │    │  response_format=       │           │
-│   │   PersonaSkillList      │    │   PresetDialogueList    │           │
-│   │                         │    │                         │           │
-│   │  perspective·refuse·    │    │  寒暄·探问·踩雷·        │           │
-│   │  deep-dive·recall·      │    │  求助·倾诉·告别         │           │
-│   │  farewell               │    │                         │           │
-│   └─────────────────────────┘    └─────────────────────────┘           │
-│   每个 skill 含:角色扮演规则·回答工作流·心智模型·决策启发式·反模式·诚实边界│
-└─────────────────────────────────────────────────────────────────────────┘
-                                  ⇣
-┌─────────────────────────────────────────────────────────────────────────┐
-│  OUTPUT LAYER · 落盘层 (renderer.py + skills_writer.py)                 │
-│                                                                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐ │
-│  │persona_card  │  │skills/*/     │  │preset_       │  │distillates │ │
-│  │  .json       │  │  SKILL.md    │  │  dialogues   │  │  .jsonl    │ │
-│  │              │  │              │  │  .json       │  │            │ │
-│  │人格ID·系统   │  │Anthropic     │  │user/assistant│  │中间蒸馏液  │ │
-│  │提示词·报错   │  │Skills规范    │  │对话对+intent │  │可审计·复现 │ │
-│  │+persona_card │  │SkillsMW可加载│  │界面右侧"预设 │  │+result.json│ │
-│  │  .md         │  │              │  │对话"         │  │            │ │
-│  └──────────────┘  └──────────────┘  └──────────────┘  └────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-
-┌─ ENGINE · 底座（贯穿全管线）─────────────────────────────────────────────┐
-│                                                                         │
-│   ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐     │
-│   │   DeepAgents     │  │ persona-         │  │   MiniMax-M3     │     │
-│   │   子智能体编排    │  │  distillation    │  │   推理模型        │     │
-│   │                  │  │   蒸馏方法论Skill │  │                  │     │
-│   │ create_deep_agent│  │ SKILL.md注入主AG │  │ OpenAI兼容协议    │     │
-│   │ SubAgent·task    │  │ SkillsMiddleware │  │ api.minimax.io   │     │
-│   │ FilesystemMW·Todo│  │ prompts.py       │  │ build_model()    │     │
-│   └──────────────────┘  └──────────────────┘  └──────────────────┘     │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## § 03 · 模块清单
-
-每个文件各司其职，可单独替换或扩展。
-
-| 模块 | 文件 | 职责 |
-|:---|:---|:---|
-| **config** | `config.py` | 运行配置中枢。模型字符串、分块参数、显著度阈值、Skills 数量上限。默认 `minimax:MiniMax-M3`。`.env` 启动时自动加载，启动即校验 API key。`dry_run` 跳过校验（CI/单测用） |
-| **schemas** | `schemas.py` | 结构化契约。PersonaCard / PersonaSkill / Distillate + **DNA 五层**（ExpressionDNA/MentalModel/DecisionHeuristic/AntiPattern/HonestBoundary）+ VerificationResult。`extra="forbid"` 严拒 schema 外字段；`model_post_init` 全空告警 |
-| **loader** | `loader.py` | 多文本聚合摄入。txt/md 直读、json/jsonl 抽取正文、csv 按行展开；`max_input_mb` 单文件大小上限 |
-| **chunker** | `chunker.py` | tiktoken 感知分块 + 重叠，避免从句中劈开 |
-| **prompts** | `prompts.py` | 蒸馏方法论 SKILL.md + 四个子智能体系统提示词（含 DNA 提炼与三重验证要求）+ intake 4 个新提示词（NER/ProfileBuilder/Bridger/Orchestrator） |
-| **agents** | `agents.py` | DeepAgents 装配工厂。`build_model` 解析 `minimax:MiniMax-M3`；蒸馏侧 4 个带 `response_format` 的子智能体 + intake 侧 4 个子智能体 + `build_intake_orchestrator` 主理人 Agent |
-| **pipeline** | `pipeline.py` | 确定性流水线。加载→分块→分馏→冷凝提纯→**三重验证**→**DNA Backfill**→设计 Skills→撰写对话 |
-| **triple_verification** | `triple_verification.py` | **DNA 三重验证**。跨域复现（distillates 证据复核）+ 生成力 + 排他性，未通过的心智模型一律丢弃 |
-| **renderer** | `renderer.py` | 人格卡渲染。`persona_card.json`（机器可导入）+ `persona_card.md`（人类可读）。用 `model_dump(exclude_none=True)` 一次性写入全部 DNA 字段 |
-| **skills_writer** | `skills_writer.py` | Skills 目录落盘。每个 skill 写成 nuwa 风格 SKILL.md：角色扮演规则 + 回答工作流 + 心智模型（含三重验证证据）+ 决策启发式 + 表达DNA + 反模式 + 诚实边界 |
-| **main** | `main.py` | CLI 入口。`distill` / `inspect` / `chat` / `webui` 四个子命令 |
-| **webui** | `webui.py` | **Gradio 调试面板**。三 Tab：蒸馏（参数表单+实时日志）/ 产物浏览（DNA 五层+Skills+对话）/ 主理人 Agent 聊天。跨 Gradio 4/5/6 兼容 |
-| **intake / dna_extractor** | `intake/dna_extractor.py` | **DNA Backfill 解析器**。6 类节标题正则（中文方括号 / 全角方括号 / 英文冒号 / Markdown 标题 / 中文圆括号 / 无前导符号）→ 5 字段结构化回填。`backfill_dna_from_system_prompt` 是 DNA 字段丢失的最后一道安全网 |
-| **intake / name_extractor** | `intake/name_extractor.py` | LLM-NER。识别分块中所有人物提及，分类为 speech/appearance/event，附原文证据与起止位置 |
-| **intake / index_store** | `intake/index_store.py` | Chroma + SQLite 双写索引。跨文件聚合人物，支持向量检索 + 类别过滤 |
-| **intake / embedder** | `intake/embedder.py` | 嵌入 + 重排序模型封装。在线走真实 sentence-transformers；离线用 `HashEmbeddings` 兜底 |
-| **intake / profile_builder** | `intake/profile_builder.py` | 人物档案摘要。从索引聚合 top-k 选段，LLM 生成 ≤200 字档案 |
-| **intake / bridge** | `intake/bridge.py` | 桥接蒸馏。`rebuild_corpus_dir` 把档案重建为临时语料；`distill_character` 调 PersonaDistiller 启动四阶段蒸馏 |
-| **intake / oc_writer** | `intake/oc_writer.py` | OC 共创 Phase 1：4 类骨架文本生成（独白/对话/事件/回忆） |
-| **intake / interview** | `intake/interview.py` | OC 共创 Phase 2：character_player 读骨架 + 主理人 N 轮访谈 |
-| **intake / tools** | `intake/tools.py` | 主理人 Agent 工具桥接层。把 `load_corpus` / `chunk_text` / `IndexStore` / `build_profile` / `distill_character` 等函数包装成 LangChain 工具，含 `generate_oc_corpus` / `run_character_interview` 工具（OC 共创） |
-| **eval / coverage** | `eval/coverage.py` | **纯规则覆盖度评估器**。统计 DNA 五层字段数 / 三重验证通过率 / 反模式数 / 诚实边界数。无需 LLM，返回 `CoverageScore(total_score, details)` |
-| **eval / fidelity** | `eval/fidelity.py` | **LLM-as-judge 忠实度评估器**。让独立模型对比 PersonaCard 与原语料打分 0~1 + 3 条理由；judge 调用失败记 -1，不阻塞其它评估 |
-| **eval / identifiability** | `eval/identifiability.py` | **LLM-as-judge 可识别度评估器**（盲猜）。用 PersonaCard 跑 probe 问题，让独立 judge 盲猜人物，返回 `guessed_name` / `confidence` / `correct` |
-| **eval / report** | `eval/report.py` | **评估报告汇总器**。合并三个评估器结果成 `EvalReport`（coverage 0.3 + fidelity 0.4 + identifiability 0.3 加权）；`llm=None` 时只跑覆盖度 |
-
----
-
-## § 04 · DNA 级别 SKILL.md 结构
-
-每个落盘的 `skills/<persona_id>-<scope>/SKILL.md` 遵循以下结构（参考 nuwa-skill）：
-
-```markdown
----
-name: <persona_id>-perspective
-description: 用 <persona> 的视角分析...
-license: MIT
----
-
-# <Persona> · 思维操作系统
-
-## 角色扮演规则（最重要）
-**此 Skill 激活后，直接以 <Persona> 的身份回应。**
-- 用「我」而非第三人称转述
-- 🛑 STOP（仅一次）：首次激活输出免责声明，后续绝不重复
-- 🚪 EXIT TRIGGER：用户说「退出」「切回正常」时立即恢复
-
-## When to Use
-触发场景...
-
-## 回答工作流 (Agentic Protocol)
-1. 用 mental_models 重新框定用户问题
-2. 用 decision_heuristics 给出判断
-3. 用 expression_dna 表达
-4. 触及 anti_patterns 时果断拒绝
-
-## 心智模型 (Mental Models)
-> 每个模型均通过三重验证：跨域复现 · 有生成力 · 有排他性
-
-### 聚焦即说不
-**原理**：专注是说不对 100 个好主意
-**跨域复现证据**：[产品]... [招聘]...
-**生成力示例**：问如何扩张 → 他先问能砍掉什么
-**排他性**：多数人靠加法扩张，他靠减法
-
-## 决策启发式 (Decision Heuristics)
-- **先问物理极限** —— 触发：优化任何系统时
-
-## 表达 DNA (Expression DNA)
-- **偏好词汇**：insanely great, shit
-- **节奏**：短句、极端确定
-- **标志性比喻**：...
-
-## 反模式 (Anti-Patterns) —— 绝对不会做什么
-- 🚫 **妥协** —— 绝不接受次优
-
-## 诚实边界 (Honest Boundaries)
-- ⚠️ **无法蒸馏直觉** —— 框架能提取，灵感不能
-- ⚠️ **仅基于公开语料的快照** —— 不等于本人真实信念
-```
-
----
-
-## § 05 · 字段映射
-
-产出与角色卡暗色界面一一对应。
-
-| 框架产出 | → | 角色卡界面 |
-|:---|:---:|:---|
-| `persona_card.persona_id` | ⟶ | 左侧 · 人格ID 输入框 |
-| `persona_card.system_prompt` | ⟶ | 左侧 · 系统提示词 区域 |
-| `persona_card.error_reply` | ⟶ | 左侧 · 自定义报错回复信息 |
-| `skills/*/SKILL.md` | ⟶ | 右侧 · Skills 选择（可指定） |
-| `preset_dialogues.json` | ⟶ | 右侧 · 预设对话（可添加） |
-
----
+> **WebUI 调试模式**（可视化）—— `webui` 子命令启动 Gradio 四 Tab 面板：蒸馏参数 / 产物浏览 / 主理人 Agent 对话 / OC 共创。
 
 ## 快速开始
 
-### 安装
-
-> **Python ≥ 3.11**（`deepagents` 的最低版本要求）
-
 ```bash
+# 安装依赖
 pip install -r requirements.txt
-cp .env.example .env       # 可选；启动时框架会自动尝试加载 .env
-${EDITOR:-vi} .env        # 填入 MINIMAX_API_KEY 等
-```
 
-环境变量：
+# 配置 API Key（以 MiniMax 为例）
+export MINIMAX_API_KEY=sk-...
+source .env  # 或用 .env 文件（python-dotenv 自动加载）
 
-| 变量 | 默认值 | 含义 |
-|:---|:---|:---|
-| `MINIMAX_API_KEY` | — | **必填**（除非 `dry_run=True`）。启动时自动校验 |
-| `MINIMAX_BASE_URL` | `https://api.minimax.io/v1` | OpenAI 兼容端点 |
-| `MINIMAX_MODEL` | `minimax:MiniMax-M3` | provider:model 字符串 |
-| `MINIMAX_PERSONA_ID` | `""` | CLI 不指定时使用的默认人格 ID |
-| `EMBEDDING_MODEL` | `BAAI/bge-m3` | intake 子包的嵌入模型 |
-| `RERANK_MODEL` | `BAAI/bge-reranker-base` | intake 子包的重排序模型 |
-| `OFFLINE` | `0` | 设为 `1` 用 `HashEmbeddings` 兜底（无网络 / 离线测试） |
-
-### CLI 一键蒸馏（确定性，可复现）
-
-```bash
-# 蒸馏（默认 --model minimax:MiniMax-M3）
+# —— CLI 直跑 ——
 python -m persona_distillation.main distill ./examples/sample_corpus ./out \
-    --persona-id arakawa_sensei
+    --model minimax:MiniMax-M3 --persona-id arakawa_sensei
 
-# 查看已蒸馏结果
+# 查看产物
 python -m persona_distillation.main inspect ./out
+
+# 质量评估（离线：只跑覆盖度；在线：三维度全跑）
+python -m persona_distillation.main eval ./out --offline
+python -m persona_distillation.main eval ./out --model minimax:MiniMax-M3
+
+# —— 主理人 Agent 模式 ——
+python -m persona_distillation.main chat
+
+# —— WebUI ——
+python -m persona_distillation.main webui --host 0.0.0.0 --port 7860
+
+# —— OC 共创（从设定捏造语料 → 蒸馏）——
+python -m persona_distillation.main cocreate
 ```
 
-### 主理人 Agent（交互式）
+## 蒸馏方法论
+
+```
+原液（多文本语料）
+  │
+  ▼
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│  分馏     │───▶│  冷凝     │───▶│  提纯     │───▶│  成品     │
+│ Fractional│    │ Condense │    │  Purify  │    │  Final   │
+│          │    │          │    │          │    │          │
+│ 按 Signal │    │ 跨分块/  │    │ 去冲突 + │    │ Persona  │
+│ Category  │    │ 跨文件   │    │ salience │    │ Card +   │
+│ 塔板分离  │    │ 聚合     │    │ 取舍     │    │ Skills + │
+│           │    │          │    │          │    │ Dialogs  │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘
+      │                                              │
+      │  intake 子包（预处理）                        │  schemas 产出
+      ▼                                              ▼
+  IndexStore                                     落盘 JSON + SKILL.md
+  (Chroma + SQLite)                              可注入 Agent 平台
+```
+
+### 四阶段详解
+
+| 阶段 | 化学隐喻 | 代码实现 | 产出 |
+|------|---------|---------|------|
+| **分馏** | 按沸点分离组分 | `Extractor` SubAgent 逐 chunk 按 SignalCategory 提取 | `Distillate` 列表（含 evidence + salience） |
+| **冷凝** | 气态 → 液态聚合 | `Synthesizer` SubAgent 跨 chunk 聚合；>30 条走 map-reduce 分批冷凝 | `PersonaCard`（persona_id + system_prompt + error_reply） |
+| **提纯** | 去杂质 | salience < 阈值丢弃；冲突信号取舍 | `PersonaSkill` 列表（DNA 五层） |
+| **成品** | 灌装 | `SkillDesigner` + `DialogueWriter` | `SKILL.md` 文件 + `PresetDialogue` 列表 |
+
+### DNA 五层
+
+每个 `PersonaSkill` 包含以下五层结构化人格信号：
+
+| 层 | 类 | 含义 |
+|----|----|------|
+| 表达 DNA | `ExpressionDNA` | 词汇偏好 / 句式节奏 / 修辞习惯 / 标志性比喻 / 开场白示范 |
+| 心智模型 | `MentalModel` | 深层信念 + **三重验证**（引文 + 逻辑推演 + 反例检测） |
+| 决策启发式 | `DecisionHeuristic` | 面对选择时的行为规则 |
+| 反模式 | `AntiPattern` | "不该这样做"的负面信号 |
+| 诚实边界 | `HonestBoundary` | 不做的事 + 理由（定格为蒸馏时点的信念） |
+
+## Intake 预处理子包
+
+intake 子包是主理人 Agent 模式的核心，负责蒸馏前的语料预处理：
+从原始文本到结构化人物索引，再到蒸馏语料重建。
+
+```
+原始语料 ──▶ load_and_chunk ──▶ NER (intake_ner SubAgent)
+                                     │
+                                     ▼
+                              index_characters
+                                     │
+                                     ▼
+                              IndexStore
+                              (Chroma + SQLite)
+                                     │
+                   ┌─────────────────┼─────────────────┐
+                   ▼                 ▼                 ▼
+            resolve_characters   list_characters   get_character_entries
+            (实体归并)            (列出人物)        (取索引条目)
+                                     │
+                                     ▼
+                              profile_builder SubAgent
+                                     │
+                                     ▼
+                              CharacterProfile
+                                     │
+                                     ▼
+                    rebuild_corpus_dir (条件脱名)
+                                     │
+                                     ▼
+                              PersonaDistiller
+```
+
+### 预处理四道防线
+
+| 防线 | 机制 | 实现 |
+|------|------|------|
+| 注入防护 | 检测 chunk 内的 prompt injection 模式 | `name_extractor._detect_injection` |
+| Evidence 校验 | NER 返回的 evidence 必须是原文精确子串 | `name_extractor._validate_evidence` |
+| JSON 抢救 | LLM 返回非标准 JSON 时用栈匹配提取 | `agents._extract_first_json_object` |
+| 失败可见性 | 分馏失败率 >50% 中止；metadata 含失败统计 | `pipeline.py` RuntimeError + stats |
+
+### P3 预处理优化（Issue #16-#19）
+
+| 优化项 | Issue | 状态 | 实现 |
+|--------|-------|------|------|
+| 多线程并行 NER | #16 | ✅ | `config.ner_parallel` + `progress.py` 线程安全锁 + 批量写库 |
+| 嵌入/重排灵活使用 | #18 | ✅ | chunk 去重（`chunker.dedup_chunks`）+ 多 query 重排（`profile_builder._multi_query_rerank`）|
+| 跨 chunk 实体归并 | #17 | ✅ | `entity_resolver.py` 三重信号融合（别名交叉 + 字符串相似 + 嵌入相似）|
+| 关系提取 + 条件脱名 | #19 | ✅ | NER prompt 加 `co_mentioned` + `relation_to`；`bridge.py` 条件脱名 + `relationships.json` |
+
+## 质量评估（eval 子包）
+
+蒸馏完成后可对产物跑三维度质量评估：
+
+| 维度 | 方法 | 指标 |
+|------|------|------|
+| **覆盖度** (Coverage) | 纯规则统计 DNA 五层完整度 | `total_score ∈ [0,1]` + 各层计数 + 验证通过率 |
+| **忠实度** (Fidelity) | LLM-as-judge 对比 PersonaCard 与原语料 | `score ∈ [0,1]` + 3 条理由 |
+| **可识别度** (Identifiability) | Probe + 盲猜：让人格卡回答 5 个通用问题，独立 judge 猜人物 | `correct: bool` + `confidence ∈ [0,1]` |
 
 ```bash
-# 启动主理人 Agent：先做人物识别 + 索引 + 档案
-# 用户从候选人物里选一位，再调 PersonaDistiller 蒸馏
-python -m persona_distillation.main chat --workdir ./intake_workdir
+# 离线模式（只跑覆盖度，不调 LLM）
+python -m persona_distillation.main eval ./out --offline
+
+# 完整模式（三维度全跑）
+python -m persona_distillation.main eval ./out --model minimax:MiniMax-M3
 ```
 
-### WebUI 调试面板（推荐用于调试）
+综合评分加权：coverage 0.3 + fidelity 0.4 + identifiability 0.3
 
-```bash
-# 启动 Gradio WebUI：三 Tab 调试面板
-# 默认监听 http://127.0.0.1:7860
-python -m persona_distillation.main webui
+## OC 共创
 
-# 自定义监听 / 启用公网分享链接
-python -m persona_distillation.main webui --host 0.0.0.0 --port 7860 --share
+从设定文本捏造语料，再蒸馏成人格卡——"无中生有"的工作流：
+
+```
+OC 设定文本
+  │
+  ▼
+Stage 1: 骨架生成（monologue + dialogue + event + memory 四篇文本）
+  │
+  ▼
+Stage 2: 血肉访谈（interviewer 对角色做访谈，扩充语料）
+  │
+  ▼
+Stage 3: 蒸馏（复用 PersonaDistiller 全流程）
+  │
+  ▼
+PersonaCard + Skills + PresetDialogues
 ```
 
-三个 Tab：
+CLI: `python -m persona_distillation.main cocreate`
+WebUI: 第四个 Tab "OC 共创"
 
-| Tab | 用途 |
-|:---|:---|
-| 🔥 **蒸馏** | 表单填参数（语料/模型/分块/显著度阈值/Skills 数量等）→ 后台跑 `PersonaDistiller.distill` → 实时日志流式刷新 → 完成后展示 DNA 五层产出摘要 |
-| 📂 **产物浏览** | 选 `out/` 子目录 → 加载 `distillation_result.json` → 渲染人格卡 / DNA 五层（含三重验证证据 ✅/❌）/ Skills（点选切换 SKILL.md）/ 预设对话表格 / 📊 评估区（overall_score 进度条 + 三项分项 + 🔄 重新评估按钮） |
-| 💬 **主理人 Agent** | 先点「启动 / 重置 Agent」构建会话级 intake orchestrator；再用自然语言驱动 5 步流程（摄入语料 → 列人物 → 选人物 → 档案 → 蒸馏） |
-| ✨ **OC 共创** | 填 OC 设定（姓名/年龄/背景/性格核心/世界观/口头禅）+ 访谈轮数 → 一键走完三阶段（骨架→访谈→蒸馏）→ 完成后点"👉 立即查看完整产物"自动跳转产物浏览 Tab 加载 |
+## 模块结构
 
-> WebUI 跨 Gradio 4/5/6 兼容。无需 API key 也能启动——产物浏览 Tab 可离线查看已有产出。
-
-> **全局跨 Tab 联动**：所有蒸馏入口（🔥 蒸馏 Tab / ✨ OC 共创 Tab / 💬 主理人 Agent Tab）
-> 完成后都有 "👉 立即查看完整产物" 按钮，一键跳转产物浏览 Tab 并自动刷新下拉、选中产物目录、
-> 加载人格卡 / DNA 五层 / Skills / 预设对话。三个入口共享同一份 `_jump_to_browse` 联动逻辑。
-
-### OC 共创蒸馏
-
-适用场景：想蒸馏一个**虚构角色（OC, Original Character）**，但手上没有现成语料。
-框架先让 sub-agent 据用户设定的 OC 生成"骨架"文本，再让 character_player sub-agent
-接受主理人访谈产出"血肉"记录，最后合并语料走现有四阶段蒸馏。
-
-三阶段串联（中间产物落 `<workdir>/<persona_id>/`，默认 workdir 为 `./oc_workdir`）：
-
-1. **Phase 1 · 骨架**：4 个 sub-agent 生成独白 / 对话 / 事件 / 回忆 4 类文本 →
-   落盘 `<workdir>/<persona_id>/oc_corpus/{monologue,dialogue,event,memory}.md`
-2. **Phase 2 · 血肉**：character_player sub-agent 读骨架作为人设基础 →
-   主理人 N 轮访谈 → 落盘 `<workdir>/<persona_id>/interview.md`
-3. **Phase 3 · 蒸馏**：骨架目录 + 血肉文件合并作为语料 →
-   调 `PersonaDistiller.distill` 走现有四阶段，产物落 `--output` 目录
-
-```bash
-# 一键走完三阶段：骨架生成 → 血肉访谈 → 蒸馏
-python -m persona_distillation.main cocreate --output ./out
-
-# 非交互式（适用于脚本/CI）
-python -m persona_distillation.main cocreate \
-  --name "星野" --age "17" \
-  --background "高中二年级，天文社社长" \
-  --traits "冷静、好奇、不善社交" \
-  --worldview "宇宙是沉默的，但沉默不等于无意义" \
-  --catchphrase "……让我想想" \
-  --rounds 8 \
-  --output ./out --persona-id hoshino
+```
+persona_distillation/
+├── __init__.py              # 对外导出
+├── main.py                  # CLI 入口（distill / inspect / chat / webui / cocreate / eval）
+├── config.py                # DistillationConfig 配置
+├── schemas.py               # Pydantic 数据契约（PersonaCard / DNA 五层 / EvalReport）
+├── agents.py                # DeepAgents 工厂（SubAgent + invoke_structured）
+├── pipeline.py              # 确定性蒸馏流水线 PersonaDistiller
+├── prompts.py               # 蒸馏方法论系统提示词 + OC 共创 prompts
+├── skills_writer.py         # PersonaSkill → SKILL.md 落盘
+├── chunker.py               # Token 感知分块器 + chunk 去重
+├── intake/                  # 预处理子包
+│   ├── __init__.py
+│   ├── tools.py             # 主理人 Agent 工具桥接（纯 IO + SubAgent 交接）
+│   ├── name_extractor.py    # LLM-NER（含注入防护 + evidence 校验）
+│   ├── index_store.py       # Chroma + SQLite 双写索引（含 merge_characters）
+│   ├── entity_resolver.py   # 跨 chunk 实体归并（三重信号融合）
+│   ├── profile_builder.py   # 人物档案构建（多 query 重排 + LLM summary）
+│   ├── bridge.py            # 蒸馏桥接（条件脱名 + relationships.json）
+│   ├── embedder.py          # 嵌入 + 重排序器（离线降级 HashEmbeddings）
+│   ├── progress.py          # 线程安全进度指示器
+│   └── schemas.py           # intake 专用 schema（NameMention / NameIndexEntry）
+├── eval/                    # 质量评估子包
+│   ├── __init__.py
+│   ├── coverage.py          # 覆盖度（纯规则）
+│   ├── fidelity.py          # 忠实度（LLM-as-judge）
+│   ├── identifiability.py   # 可识别度（probe + 盲猜）
+│   └── report.py            # 汇总报告
+└── webui/                   # Gradio WebUI
+    ├── __init__.py          # build_ui + launch
+    ├── state.py             # 共享状态 + 跨 Tab 联动 + 主题样式
+    ├── tab_distill.py       # Tab 1: 蒸馏参数
+    ├── tab_browse.py        # Tab 2: 产物浏览
+    ├── tab_agent.py         # Tab 3: 主理人 Agent 对话
+    └── tab_cocreate.py      # Tab 4: OC 共创
 ```
 
-### 质量评估
+## CLI 子命令
 
-对已落盘的蒸馏产物跑三维度评估，量化人格还原度，产出 `eval_report.json`。
+| 子命令 | 用途 | 需要 API Key |
+|--------|------|-------------|
+| `distill` | CLI 直跑蒸馏 | ✅ |
+| `inspect` | 查看蒸馏产物 | ❌ |
+| `chat` | 主理人 Agent 交互 | ✅ |
+| `webui` | Gradio 调试面板 | 产物浏览 Tab 不需要 |
+| `cocreate` | OC 共创蒸馏 | ✅ |
+| `eval` | 质量评估（`--offline` 不需要） | `--offline` 时不需要 |
 
-```bash
-# 对已落盘的蒸馏产物跑评估（含 LLM judge）
-python -m persona_distillation.main eval ./out/hoshino
+## 配置
 
-# 仅离线评估（只跑覆盖度，不调 LLM）
-python -m persona_distillation.main eval ./out/hoshino --offline
-```
-
-三个评估维度：
-
-| 维度 | 评估器 | 方式 | 说明 |
-|:---|:---|:---|:---|
-| **覆盖度** | `eval/coverage` | 纯规则 | DNA 五层字段数 / 三重验证通过率 / 反模式数。无需 LLM |
-| **忠实度** | `eval/fidelity` | LLM-as-judge | 独立模型对比 PersonaCard 与原语料，打分 0~1 + 3 条理由 |
-| **可识别度** | `eval/identifiability` | LLM-as-judge | 用 PersonaCard 跑 probe 问题，让独立 judge 盲猜人物 |
-
-评估完成后在产物目录落盘 `eval_report.json`（含三项分项 + 加权 `overall_score` + 人类可读 Markdown 摘要）。
-`--offline` 时只跑覆盖度；judge 调用失败优雅降级（该项记 -1，不阻塞其它评估）。
-
-> 蒸馏时同步评估：CLI `distill` 子命令不带评估开关，请在 Python API 传 `eval=True`，
-> 或蒸馏完成后用 `eval` 子命令对产物补跑评估。
-> ```python
-> result = distiller.distill("./corpus", output_dir="./out", eval=True)
-> ```
-
-### Python API
+通过 `DistillationConfig` dataclass 或环境变量配置：
 
 ```python
-from persona_distillation import PersonaDistiller, DistillationConfig
+from persona_distillation import DistillationConfig
 
-distiller = PersonaDistiller(DistillationConfig(
-    model="minimax:MiniMax-M3", persona_id="arakawa_sensei"
-))
-result = distiller.distill("examples/sample_corpus", output_dir="./out")
+cfg = DistillationConfig(
+    model="minimax:MiniMax-M3",      # provider:model 格式
+    chunk_size=1800,                 # 蒸馏阶段分块 token 数
+    intake_chunk_size=1200,          # intake NER 分块 token 数
+    ner_parallel=4,                  # NER 并行度（I/O bound）
+    auto_merge=True,                 # 跨 chunk 实体归并
+    auto_merge_threshold=0.85,       # 字符串相似度阈值
+    chunk_dedup_threshold=0.95,      # chunk 去重 cosine 阈值
+    detect_injection=True,           # 提示注入防护
+    enable_chunk_cache=True,         # 断点续传
+    offline=False,                   # 离线模式（HashEmbeddings）
+    dry_run=False,                   # 跳过 API key 校验（CI/测试）
+)
 ```
 
-### 主理人 Agent（交互式，蒸馏侧）
+关键环境变量：
 
-```python
-from persona_distillation.agents import build_intake_orchestrator
-from persona_distillation.config import DistillationConfig
+| 变量 | 用途 |
+|------|------|
+| `MINIMAX_API_KEY` | MiniMax API 密钥 |
+| `MINIMAX_MODEL` | 模型名（默认 `minimax:MiniMax-M3`） |
+| `MINIMAX_BASE_URL` | OpenAI 兼容 endpoint |
+| `EMBEDDING_MODEL` | 嵌入模型（默认 `BAAI/bge-m3`） |
+| `RERANK_MODEL` | 重排序模型（默认 `BAAI/bge-reranker-base`） |
+| `OFFLINE` | 离线模式（`1`/`true`） |
 
-agent = build_intake_orchestrator(DistillationConfig(model="minimax:MiniMax-M3"))
-agent.invoke({"messages": [{"role": "user", "content": "蒸馏 ./corpus 到 ./out"}]})
-```
-
----
-
-## 产出结构
+## 产物结构
 
 ```
 out/
-├── persona_card.json          # 人格卡（含 DNA 五层）
-├── persona_card.md            # 人类可读版
+├── distillation_result.json    # 完整蒸馏结果（PersonaCard + Skills + Dialogues + metadata）
+├── persona_card.json           # 人格卡单独导出
 ├── skills/
-│   ├── <persona_id>-perspective/SKILL.md   # DNA 级别 skill
-│   ├── <persona_id>-refuse/SKILL.md
-│   ├── <persona_id>-deep-dive/SKILL.md
-│   └── ...
-├── preset_dialogues.json      # 预设对话对
-├── distillates.jsonl          # 中间蒸馏液（可审计）
-└── distillation_result.json   # 完整结果（不含 distillates）
+│   └── <skill_name>/
+│       └── SKILL.md            # Anthropic Agent Skills 规范
+└── eval_report.json            # 质量评估报告（eval 子命令产出）
 ```
 
----
-
-## § 06 · 4 道防线（DNA 字段完整性保障）
-
-LLM 经常"擅自"把 DNA 五层塞进 `system_prompt` 文本里（典型如 MiniMax-M3 端点），
-导致 `persona_card.json` 顶层 DNA 字段全空、机器读不到。
-本框架从四个层面交叉保障：
-
-| # | 防线 | 位置 | 作用 |
-|:---:|:---|:---|:---|
-| 1 | **后处理回填** | `pipeline._condense_and_purify` → `intake.dna_extractor.backfill_dna_from_system_prompt` | 6 类节标题正则解析 system_prompt 文本 → 5 字段结构化（安全网） |
-| 2 | **Schema 严格化** | `schemas.PersonaCard.model_config = ConfigDict(extra="forbid")` | 拒绝 LLM 输出的 schema 外字段（`tools` / `skills` 等） |
-| 3 | **Renderer 修正** | `renderer.py` 改用 `card.model_dump(exclude_none=True)` | 不再因手写字段列表而漏掉 DNA 字段（**这才是字段空值的真正元凶**） |
-| 4 | **提示词强化** | `prompts.SYNTHESIZER_SYSTEM` 末尾追加"禁止" + "塞进" + "system_prompt" | 显式告诉 LLM：DNA 五层必须作为独立结构化字段输出 |
-
-另有两道结构化保障：
-
-- `error_reply` 改为可选 + 默认空字符串——适配 LLM 偶尔缺该字段的不稳定输出。
-- `PersonaCard.model_post_init` 检测 5 字段全空时输出 WARNING——给未来"system_prompt 也丢了"的灾难场景留监控钩子。
-
-### 端到端验证
-
-`examples/sample_corpus` 真实蒸馏后 `out/persona_card.json` 实际产出：
-
-| 字段 | 实际值 |
-|---|---:|
-| `mental_models` | 4 |
-| `anti_patterns` | 6 |
-| `expression_dna.vocabulary` | 10 |
-| `expression_dna.signature_metaphors` | 4 |
-| `expression_dna.opening_samples` | 2 |
-| 落盘 SKILL.md 数 | 5 |
-| 预设对话数 | 8 |
-
-> `decision_heuristics` / `honest_boundaries` 在某些 LLM 端点下为 0——
-> 模型把这类信号融进了 `[输出约束]` / `[雷区]` 等其他节，
-> 无独立节标题时 backfill 无法识别（"宁缺毋滥"原则接受此结果）。
-
----
-
-## § 07 · 测试
+## 测试
 
 ```bash
-.venv/bin/python -m tests.smoke_test              # 11/11
-.venv/bin/python -m tests.optimization_verify     # 33/33
-.venv/bin/python -m pytest tests/dna_extractor_test.py -v        # 15/15
-.venv/bin/python -m pytest tests/test_schema_strictness.py -v   #  5/5
-# Total: 64/64
+# 全量 pytest（50 tests）
+python -m pytest tests/ -v
+
+# 离线烟雾测试（无需 API key）
+python -m tests.smoke_test
+python -m tests.optimization_verify
 ```
 
----
+| 测试文件 | 覆盖范围 |
+|---------|---------|
+| `test_eval_coverage.py` | 覆盖度评估器（纯规则，含空卡 / 验证失败 / 权重验证） |
+| `test_eval_report.py` | 汇总报告（FakeLLM 模拟 fidelity + identifiability + JSON round-trip） |
+| `test_invoke_structured.py` | JSON 抢救逻辑（栈匹配 / 自然语言花括号 / 嵌套对象） |
+| `test_pipeline_failure.py` | 分馏失败可见性（高失败率中止 / 低失败率继续 / metadata 统计） |
+| `test_chunk_cache.py` | 分块缓存（确定性 UUID / 断点续传 / corpus_registry） |
+| `test_schema_strictness.py` | Schema 严格性（Pydantic 校验 / 必填字段） |
+| `test_interview.py` | OC 共创访谈流程 |
+| `test_oc_writer.py` | OC 共创文本生成 |
+| `dna_extractor_test.py` | DNA 提取器 |
+| `smoke_test.py` | 离线烟雾测试（schemas / loader / chunker / skills_writer） |
+| `optimization_verify.py` | 优化验证器 |
 
 ## 技术栈
 
