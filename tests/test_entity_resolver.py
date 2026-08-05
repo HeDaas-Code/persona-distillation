@@ -1,4 +1,4 @@
-''""``intake.entity_resolver`` 单元测试。
+"""``intake.entity_resolver`` 单元测试。
 
 覆盖实体归并器的核心纯函数与集成逻辑：
 - 字符串相似度：``levenshtein`` / ``jaro`` / ``jaro_winkler`` / ``strings_similar``

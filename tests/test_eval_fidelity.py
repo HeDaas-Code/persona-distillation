@@ -1,4 +1,4 @@
-''""``eval.fidelity`` 单元测试。
+"""``eval.fidelity`` 单元测试。
 
 覆盖忠实度评估器中的纯逻辑函数（不依赖真实 LLM）：
 - ``_extract_content``：兼容 LangChain 新旧 content 格式
